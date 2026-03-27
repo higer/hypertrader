@@ -1,0 +1,19 @@
+version: "3.8"
+
+services:
+  hypertrader:
+    build: .
+    container_name: hypertrader
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    env_file:
+      - backend/.env
+    volumes:
+      - ./data:/app/data_persist
+      - ./backend/system_config.json:/app/system_config.json
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
