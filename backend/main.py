@@ -152,8 +152,16 @@ async def trading_loop():
             if not cfg.dry_run:
                 all_cmds = result["entries"] + result["exits"]
                 if all_cmds:
+                    logger.info(f"LIVE MODE — sending {len(all_cmds)} command(s) to OpenClaw Agent")
+                    await notifier.on_system(
+                        f"Sending {len(all_cmds)} order(s) to Agent: "
+                        + ", ".join(f"{c['action']} {c.get('direction','')} {c['coin']}" for c in all_cmds)
+                    )
                     exec_results = await executor.execute_commands(all_cmds)
                     for er in exec_results:
+                        success = "error" not in er["result"]
+                        status_str = "OK" if success else f"FAIL: {er['result'].get('error','?')}"
+                        logger.info(f"Agent result: {er['cmd']['action']} {er['cmd']['coin']} → {status_str}")
                         await notifier.on_order(er["cmd"], er["result"])
 
             # -- Broadcast to frontend --
@@ -255,6 +263,7 @@ async def update_config(body: ConfigUpdate):
         state["engine"] = StrategyEngine(new_cfg, state["collector"], state["risk"])
         state["executor"].cfg = new_cfg.openclaw
         state["executor"].base = new_cfg.openclaw.agent_endpoint.rstrip("/")
+        state["executor"]._working_endpoint = None  # reset cached endpoint on config change
         # Update notifier config
         state["notifier"].cfg = new_cfg.alert
         state["notifier"]._tg_configured = bool(new_cfg.alert.telegram_bot_token and new_cfg.alert.telegram_chat_id)

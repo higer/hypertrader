@@ -83,9 +83,18 @@ class AlertConfig(BaseModel):
     log_file: str = "trading.log"
 
 class OpenClawConfig(BaseModel):
-    agent_endpoint: str = "http://localhost:8100"
-    api_key: Optional[str] = None
-    timeout: int = 30
+    agent_endpoint: str = Field(
+        default_factory=lambda: os.getenv("OPENCLAW_ENDPOINT", "http://127.0.0.1:18789"),
+        description="OpenClaw Gateway URL"
+    )
+    api_key: Optional[str] = Field(
+        default_factory=lambda: os.getenv("OPENCLAW_API_KEY"),
+        description="API key / bearer token for OpenClaw"
+    )
+    timeout: int = 60           # agent may need time to process
+    poll_interval: float = 2.0  # seconds between job status polls
+    max_poll_attempts: int = 30 # max polls before timeout
+    confirm_before_execute: bool = True  # require confirmation for large trades
 
 class SystemConfig(BaseModel):
     dry_run: bool = True                     # True = no real execution, signals only

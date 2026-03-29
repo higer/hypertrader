@@ -181,21 +181,44 @@ class Notifier:
         await self.send_html(html)
 
     async def on_order(self, cmd: dict, result: dict):
-        """Legacy — order sent to agent."""
+        """Notification when an order is sent to the OpenClaw Agent."""
         action = cmd.get("action", "?")
         coin = cmd.get("coin", "?")
         direction = cmd.get("direction", "?")
-        msg = f"ORDER {action.upper()} {direction.upper()} {coin}"
-        if action == "open":
-            msg += f" ${cmd.get('size_usd',0):.0f} lev={cmd.get('leverage',0)}"
-        elif action == "close":
-            msg += f" reason={cmd.get('reason','')}"
         error = result.get("error")
+
         if error:
-            msg += f" ERROR: {error}"
-            await self.send(msg, "error")
+            html = (
+                f"<b>❌ AGENT ORDER FAILED</b>\n"
+                f"<code>━━━━━━━━━━━━━━━━━━━━━</code>\n"
+                f"Action: {action.upper()} {direction.upper()} {coin}\n"
+            )
+            if action == "open":
+                html += f"Size: ${cmd.get('size_usd',0):.0f} | Lev: {cmd.get('leverage',0)}×\n"
+            elif action == "close":
+                html += f"Reason: {cmd.get('reason','')}\n"
+            html += f"<b>Error:</b> <code>{str(error)[:200]}</code>"
+            await self.send_html(html, "error")
         else:
-            await self.send(msg)
+            html = (
+                f"<b>✅ AGENT ORDER SENT</b>\n"
+                f"<code>━━━━━━━━━━━━━━━━━━━━━</code>\n"
+                f"Action: {action.upper()} {direction.upper()} {coin}\n"
+            )
+            if action == "open":
+                html += (
+                    f"Size: <code>${cmd.get('size_usd',0):.0f}</code> | "
+                    f"Lev: <code>{cmd.get('leverage',0)}×</code>\n"
+                    f"SL: <code>{cmd.get('stop_loss','?')}</code> | "
+                    f"TP: <code>{cmd.get('take_profit','?')}</code>\n"
+                    f"Strategy: {cmd.get('strategy','?')}\n"
+                )
+            elif action == "close":
+                html += f"Reason: {cmd.get('reason','')}\n"
+            # Include agent response snippet
+            resp_str = json.dumps(result, default=str)[:150]
+            html += f"<i>Agent: {resp_str}</i>"
+            await self.send_html(html)
 
     async def on_risk_event(self, event: str, details: str = ""):
         html = f"<b>⚠️ RISK — {event}</b>\n{details}"
