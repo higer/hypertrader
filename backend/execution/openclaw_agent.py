@@ -111,15 +111,13 @@ class OpenClawExecutor:
         if self._working_endpoint:
             return await self._try_send(self._working_endpoint, prompt)
 
-        # OpenClaw Gateway may expose different endpoint paths depending
-        # on version. Try the most common patterns in order.
+        # OpenClaw Gateway endpoints — ordered by priority.
+        # /v1/chat/completions requires chatCompletions.enabled: true in config
+        # /v1/responses requires responses.enabled: true in config
         endpoint_candidates = [
-            "/api/v1/chat",          # common REST chat endpoint
-            "/api/chat",             # alternative
-            "/v1/chat/completions",  # OpenAI-compatible
-            "/api/v1/execute",       # direct execution
-            "/api/prompt",           # Bankr-style
-            "/chat",                 # minimal
+            "/v1/chat/completions",  # OpenAI-compatible (most reliable)
+            "/v1/responses",         # OpenResponses-compatible
+            "/tools/invoke",         # Direct tool invocation (always available)
         ]
 
         last_error = None
@@ -143,55 +141,97 @@ class OpenClawExecutor:
         return {"error": error_msg}
 
     async def _try_send(self, endpoint: str, prompt: str) -> dict:
-        """Try sending a prompt to a specific endpoint with different payload formats."""
+        """Try sending a prompt to a specific endpoint with the correct payload format."""
         url = f"{self.base}{endpoint}"
 
-        payload_variants = [
-            {"message": prompt, "stream": False},
-            {"messages": [{"role": "user", "content": prompt}], "stream": False},
-            {"prompt": prompt},
-        ]
+        # Build the correct payload based on the endpoint type
+        if endpoint == "/v1/chat/completions":
+            payload = {
+                "model": "openclaw",
+                "messages": [{"role": "user", "content": prompt}],
+                "stream": False,
+            }
+        elif endpoint == "/v1/responses":
+            payload = {
+                "model": "openclaw",
+                "input": prompt,
+            }
+        elif endpoint == "/tools/invoke":
+            # Use tools/invoke to send as a session message
+            # This wraps the prompt into a tool call that the agent processes
+            payload = {
+                "tool": "computer",
+                "action": "json",
+                "args": {"command": prompt},
+            }
+        else:
+            payload = {
+                "model": "openclaw",
+                "messages": [{"role": "user", "content": prompt}],
+                "stream": False,
+            }
 
-        for payload in payload_variants:
-            try:
-                async with self._session.post(
-                    url, json=payload,
-                    timeout=aiohttp.ClientTimeout(total=self.cfg.timeout)
-                ) as r:
-                    if r.status == 404:
-                        return {"error": f"404 at {url}"}
+        try:
+            async with self._session.post(
+                url, json=payload,
+                timeout=aiohttp.ClientTimeout(total=self.cfg.timeout)
+            ) as r:
+                if r.status == 404:
+                    return {"error": f"404 at {url}"}
+                if r.status == 403:
+                    return {"error": f"403 Forbidden at {url} — check API key/token"}
 
-                    try:
-                        body = await r.json()
-                    except Exception:
-                        body = {"raw": await r.text()}
+                try:
+                    body = await r.json()
+                except Exception:
+                    body = {"raw": await r.text()}
 
-                    record = {
-                        "ts": time.time(),
-                        "url": url,
-                        "prompt": prompt[:200],
-                        "status": r.status,
-                        "response": body,
-                    }
-                    self.order_log.append(record)
-                    if len(self.order_log) > 500:
-                        self.order_log = self.order_log[-500:]
+                record = {
+                    "ts": time.time(),
+                    "url": url,
+                    "prompt": prompt[:200],
+                    "status": r.status,
+                    "response": body,
+                }
+                self.order_log.append(record)
+                if len(self.order_log) > 500:
+                    self.order_log = self.order_log[-500:]
 
-                    if r.status >= 400:
-                        logger.error(f"OpenClaw error {r.status}: {body}")
-                        return {"error": f"HTTP {r.status}", "details": body}
+                if r.status >= 400:
+                    logger.error(f"OpenClaw error {r.status}: {body}")
+                    return {"error": f"HTTP {r.status}", "details": body}
 
-                    logger.info(f"OpenClaw prompt sent OK via {endpoint}")
-                    return body
+                # Extract the assistant's response text
+                result = self._extract_response(body, endpoint)
+                logger.info(f"OpenClaw prompt sent OK via {endpoint}")
+                return result
 
-            except asyncio.TimeoutError:
-                return {"error": f"Timeout sending to {url}"}
-            except aiohttp.ClientError as e:
-                return {"error": f"Connection error: {e}"}
-            except Exception as e:
-                continue
+        except asyncio.TimeoutError:
+            return {"error": f"Timeout sending to {url}"}
+        except aiohttp.ClientError as e:
+            return {"error": f"Connection error: {e}"}
+        except Exception as e:
+            return {"error": f"Unexpected error: {e}"}
 
-        return {"error": f"All payload formats failed for {url}"}
+    def _extract_response(self, body: dict, endpoint: str) -> dict:
+        """Extract the useful response from different endpoint formats."""
+        if endpoint == "/v1/chat/completions":
+            # OpenAI format: body.choices[0].message.content
+            choices = body.get("choices", [])
+            if choices:
+                msg = choices[0].get("message", {})
+                return {
+                    "response": msg.get("content", ""),
+                    "role": msg.get("role", "assistant"),
+                    "raw": body,
+                }
+        elif endpoint == "/v1/responses":
+            # OpenResponses format
+            output = body.get("output", body.get("response", ""))
+            return {"response": output, "raw": body}
+
+        # Fallback — return body as-is
+        return body
 
     async def _send_and_poll(self, prompt: str) -> dict:
         """Send prompt, and if the response includes a job ID, poll until done."""
@@ -271,11 +311,11 @@ class OpenClawExecutor:
         """Query agent for health / balance / positions."""
         await self._ensure_session()
 
-        # Try health endpoints first
+        # Try health endpoints (always available on OpenClaw Gateway)
         health_urls = [
-            f"{self.base}/api/v1/status",
             f"{self.base}/health",
-            f"{self.base}/api/health",
+            f"{self.base}/healthz",
+            f"{self.base}/ready",
         ]
         for url in health_urls:
             try:
