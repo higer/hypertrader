@@ -28,6 +28,7 @@ MIN_24H_VOLUME_USD = 5_000_000  # additional floor
 # ---------------------------------------------------------------------------
 
 class RiskConfig(BaseModel):
+    initial_equity: float = Field(10000, description="Starting equity / total trading capital (USD)")
     max_position_pct: float = Field(0.05, description="Max % of equity per position")
     max_drawdown_pct: float = Field(0.08, description="Hard drawdown stop (8%)")
     max_open_positions: int = Field(6, description="Max simultaneous positions")

@@ -921,6 +921,7 @@ function renderConfig() {
   const c = config;
   const sections = [
     { key:'risk', title:'Risk Management', icon:'🛡', fields: [
+      {k:'initial_equity', label:'Total Trading Capital ($)', type:'number', step:100},
       {k:'max_position_pct', label:'Max Position %', type:'number', step:0.01},
       {k:'max_drawdown_pct', label:'Max Drawdown %', type:'number', step:0.01},
       {k:'max_open_positions', label:'Max Open Positions', type:'number', step:1},

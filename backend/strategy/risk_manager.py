@@ -30,11 +30,12 @@ class Position:
 
 class RiskManager:
 
-    def __init__(self, cfg: RiskConfig, initial_equity: float = 10_000):
+    def __init__(self, cfg: RiskConfig, initial_equity: float = None):
         self.cfg = cfg
-        self.equity = initial_equity
-        self.peak_equity = initial_equity
-        self.daily_start_equity = initial_equity
+        equity = initial_equity if initial_equity is not None else cfg.initial_equity
+        self.equity = equity
+        self.peak_equity = equity
+        self.daily_start_equity = equity
         self.positions: Dict[str, Position] = {}
         self.closed_trades: List[dict] = []
         self._cooldowns: Dict[str, float] = {}  # coin → reentry time
@@ -112,6 +113,52 @@ class RiskManager:
                      f"@ {pos.entry_price} SL={pos.stop_loss} TP={pos.take_profit}")
         return pos
 
+    def rollback_position(self, coin: str, direction: str):
+        """Remove a position that was opened internally but failed on ACP.
+        Called when the executor returns an error for an open command."""
+        key = f"{coin}_{direction}"
+        if key in self.positions:
+            pos = self.positions.pop(key)
+            logger.warning(f"ROLLBACK {pos.direction.upper()} {pos.coin} "
+                          f"${pos.size_usd:.0f} — ACP execution failed")
+            return True
+        return False
+
+    def rollback_exit(self, exit_record: dict):
+        """Restore a position that was closed internally but failed on ACP.
+        Called when the executor returns an error for a close command."""
+        coin = exit_record["coin"]
+        direction = exit_record["direction"]
+        key = f"{coin}_{direction}"
+
+        # Re-create the position from the exit record
+        # Undo the equity change
+        self.equity -= exit_record.get("pnl_usd", 0)
+        self.peak_equity = max(self.peak_equity, self.equity)
+
+        # Remove from closed_trades
+        if self.closed_trades and self.closed_trades[-1].get("coin") == coin:
+            self.closed_trades.pop()
+
+        # Remove cooldown
+        if coin in self._cooldowns:
+            del self._cooldowns[coin]
+
+        # Restore position (use entry price from the exit record)
+        pos = Position(
+            coin=coin,
+            direction=direction,
+            entry_price=exit_record.get("entry", 0),
+            size_usd=exit_record.get("size_usd", 0),
+            stop_loss=exit_record.get("stop_loss", 0),
+            take_profit=exit_record.get("take_profit", 0),
+            trailing_stop=exit_record.get("stop_loss", 0),
+            strategy=exit_record.get("strategy", ""),
+        )
+        self.positions[key] = pos
+        logger.warning(f"ROLLBACK EXIT {direction.upper()} {coin} — "
+                      f"ACP close failed, position restored")
+
     def check_exits(self, prices: Dict[str, float]) -> List[dict]:
         """Check all open positions for SL/TP/trailing-stop hits."""
         exits = []
@@ -163,6 +210,10 @@ class RiskManager:
                     "pnl_pct": round(pnl_pct * 100, 2),
                     "pnl_usd": round(pnl_usd, 2),
                     "duration_s": round(time.time() - pos.opened_at, 1),
+                    # Preserve for rollback
+                    "size_usd": pos.size_usd,
+                    "stop_loss": pos.stop_loss,
+                    "take_profit": pos.take_profit,
                 }
                 self.closed_trades.append(record)
                 exits.append(record)

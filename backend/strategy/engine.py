@@ -94,6 +94,12 @@ class StrategyEngine:
                 "reason": ex["reason"],
                 "pnl_pct": ex["pnl_pct"],
                 "pnl_usd": ex["pnl_usd"],
+                # Preserve position data for rollback if ACP fails
+                "entry": ex.get("entry", 0),
+                "size_usd": ex.get("size_usd", 0),
+                "stop_loss": ex.get("stop_loss", 0),
+                "take_profit": ex.get("take_profit", 0),
+                "strategy": ex.get("strategy", ""),
             })
         return commands
 

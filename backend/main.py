@@ -163,11 +163,31 @@ async def trading_loop():
                         + ", ".join(f"{c['action']} {c.get('direction','')} {c['coin']}" for c in all_cmds)
                     )
                     exec_results = await executor.execute_commands(all_cmds)
+                    risk: RiskManager = state["risk"]
                     for er in exec_results:
-                        success = "error" not in er["result"]
-                        status_str = "OK" if success else f"FAIL: {er['result'].get('error','?')}"
-                        logger.info(f"Agent result: {er['cmd']['action']} {er['cmd']['coin']} → {status_str}")
-                        await notifier.on_order(er["cmd"], er["result"])
+                        cmd = er["cmd"]
+                        res = er["result"]
+                        success = "error" not in res
+                        status_str = "OK" if success else f"FAIL: {res.get('error','?')}"
+                        logger.info(f"Agent result: {cmd['action']} {cmd['coin']} → {status_str}")
+                        await notifier.on_order(cmd, res)
+
+                        # Sync internal state with ACP result
+                        if not success:
+                            if cmd["action"] == "open":
+                                # ACP failed to open → remove internal position
+                                risk.rollback_position(cmd["coin"], cmd["direction"])
+                                await notifier.on_system(
+                                    f"Rolled back OPEN {cmd['direction']} {cmd['coin']} "
+                                    f"— ACP failed: {res.get('error','?')}"
+                                )
+                            elif cmd["action"] == "close":
+                                # ACP failed to close → restore internal position
+                                risk.rollback_exit(cmd)
+                                await notifier.on_system(
+                                    f"Rolled back CLOSE {cmd['direction']} {cmd['coin']} "
+                                    f"— ACP failed, position restored"
+                                )
 
             # -- Broadcast to frontend --
             await broadcast({"type": "tick", "data": state["last_tick"]})
