@@ -3,12 +3,10 @@ Main entry-point – FastAPI server.
 Exposes REST API for the frontend dashboard and runs the autonomous
 trading loop in the background.
 
-Dry-run mode (default):
-  - Fetches real market data from Hyperliquid
-  - Runs all strategies and generates real signals
-  - Simulates positions in-memory (paper trading)
-  - Pushes signals + entries/exits to Telegram
-  - Does NOT send orders to OpenClaw agent
+Execution modes:
+  - Dry-run (default): paper trading with real market data
+  - Live + DGClaw: direct ACP job execution (high-frequency, no AI overhead)
+  - Live + OpenClaw: natural-language prompts via AI gateway (legacy)
 """
 
 import asyncio, time, json, os, sys, traceback
@@ -29,6 +27,7 @@ from data.collector import DataCollector
 from strategy.engine import StrategyEngine
 from strategy.risk_manager import RiskManager
 from execution.openclaw_agent import OpenClawExecutor
+from execution.dgclaw_executor import DGClawExecutor
 from alerts.notifier import Notifier
 
 # ---------------------------------------------------------------------------
@@ -45,7 +44,13 @@ async def lifespan(app: FastAPI):
     collector = DataCollector(cfg)
     risk = RiskManager(cfg.risk)
     engine = StrategyEngine(cfg, collector, risk)
-    executor = OpenClawExecutor(cfg.openclaw)
+    # Choose executor: DGClaw (direct ACP) or OpenClaw (NL AI)
+    if cfg.dgclaw.enabled:
+        executor = DGClawExecutor(cfg.dgclaw)
+        logger.info("Executor: DGClaw (direct ACP — high-frequency mode)")
+    else:
+        executor = OpenClawExecutor(cfg.openclaw)
+        logger.info("Executor: OpenClaw (NL AI gateway)")
     notifier = Notifier(cfg.alert)
 
     state["cfg"] = cfg
@@ -121,7 +126,7 @@ async def ws_endpoint(ws: WebSocket):
 
 async def trading_loop():
     engine: StrategyEngine = state["engine"]
-    executor: OpenClawExecutor = state["executor"]
+    executor = state["executor"]
     notifier: Notifier = state["notifier"]
     cfg: SystemConfig = state["cfg"]
 
@@ -152,7 +157,7 @@ async def trading_loop():
             if not cfg.dry_run:
                 all_cmds = result["entries"] + result["exits"]
                 if all_cmds:
-                    logger.info(f"LIVE MODE — sending {len(all_cmds)} command(s) to OpenClaw Agent")
+                    logger.info(f"LIVE MODE — sending {len(all_cmds)} command(s) to executor")
                     await notifier.on_system(
                         f"Sending {len(all_cmds)} order(s) to Agent: "
                         + ", ".join(f"{c['action']} {c.get('direction','')} {c['coin']}" for c in all_cmds)
@@ -218,8 +223,7 @@ async def get_status():
 async def agent_status():
     if state["cfg"].dry_run:
         return {"status": "dry_run", "message": "Agent disabled in dry-run mode", "connected": False}
-    executor: OpenClawExecutor = state["executor"]
-    return await executor.get_agent_status()
+    return await state["executor"].get_agent_status()
 
 
 @app.post("/api/start")
@@ -261,9 +265,26 @@ async def update_config(body: ConfigUpdate):
         state["collector"].candle_store.lookback = new_cfg.data_lookback_bars
         state["risk"].cfg = new_cfg.risk
         state["engine"] = StrategyEngine(new_cfg, state["collector"], state["risk"])
-        state["executor"].cfg = new_cfg.openclaw
-        state["executor"].base = new_cfg.openclaw.agent_endpoint.rstrip("/")
-        state["executor"]._working_endpoint = None  # reset cached endpoint on config change
+
+        # Hot-swap executor if type changed
+        old_executor = state["executor"]
+        if new_cfg.dgclaw.enabled and not isinstance(old_executor, DGClawExecutor):
+            await old_executor.close()
+            state["executor"] = DGClawExecutor(new_cfg.dgclaw)
+            logger.info("Executor switched to DGClaw (direct ACP)")
+        elif not new_cfg.dgclaw.enabled and not isinstance(old_executor, OpenClawExecutor):
+            await old_executor.close()
+            state["executor"] = OpenClawExecutor(new_cfg.openclaw)
+            logger.info("Executor switched to OpenClaw (NL AI)")
+        else:
+            # Same type — update config in-place
+            if isinstance(old_executor, DGClawExecutor):
+                old_executor.cfg = new_cfg.dgclaw
+            else:
+                old_executor.cfg = new_cfg.openclaw
+                old_executor.base = new_cfg.openclaw.agent_endpoint.rstrip("/")
+                old_executor._working_endpoint = None
+
         # Update notifier config
         state["notifier"].cfg = new_cfg.alert
         state["notifier"]._tg_configured = bool(new_cfg.alert.telegram_bot_token and new_cfg.alert.telegram_chat_id)
@@ -358,6 +379,42 @@ async def get_scanner():
     """Market proximity scanner — shows how close each coin is to triggering."""
     engine: StrategyEngine = state["engine"]
     return {"coins": engine.market_scan()}
+
+
+@app.get("/api/dgclaw/positions")
+async def dgclaw_positions():
+    """Live positions from DGClaw trader (on-chain)."""
+    executor = state["executor"]
+    if not isinstance(executor, DGClawExecutor):
+        return {"error": "DGClaw executor not active"}
+    return await executor.get_positions()
+
+
+@app.get("/api/dgclaw/account")
+async def dgclaw_account():
+    """Account balance from DGClaw trader."""
+    executor = state["executor"]
+    if not isinstance(executor, DGClawExecutor):
+        return {"error": "DGClaw executor not active"}
+    return await executor.get_account()
+
+
+@app.get("/api/dgclaw/trades")
+async def dgclaw_trades(pair: str = None, limit: int = 50):
+    """Trade history from DGClaw trader."""
+    executor = state["executor"]
+    if not isinstance(executor, DGClawExecutor):
+        return {"error": "DGClaw executor not active"}
+    return await executor.get_trade_history(pair=pair, limit=limit)
+
+
+@app.get("/api/dgclaw/tickers")
+async def dgclaw_tickers():
+    """All supported tickers from DGClaw."""
+    executor = state["executor"]
+    if not isinstance(executor, DGClawExecutor):
+        return {"error": "DGClaw executor not active"}
+    return await executor.get_tickers()
 
 
 # ---------------------------------------------------------------------------

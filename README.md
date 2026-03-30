@@ -6,6 +6,7 @@ Autonomous cryptocurrency trading system for Hyperliquid perpetual futures.
 
 - **4 trading strategies**: Momentum (EMA crossover), Mean Reversion (Bollinger Bands), Breakout (Donchian Channel), Funding Arbitrage
 - **Risk management**: Kelly-lite sizing, drawdown circuit breaker, trailing stops, daily loss limits, per-coin cooldowns
+- **DGClaw direct execution**: Bypasses OpenClaw AI processing, sends structured ACP jobs directly to Degenerate Claw Trader for high-frequency execution
 - **Real-time dashboard**: Dark-themed trading terminal with live WebSocket updates
 - **Market scanner**: Proximity analysis showing how close each coin is to triggering signals
 - **Telegram alerts**: Rich HTML-formatted notifications for signals, entries, exits, and stats
@@ -39,7 +40,8 @@ backend/
     funding_arb.py     # Funding rate arbitrage
     risk_manager.py    # Position sizing + risk controls
   execution/
-    openclaw_agent.py  # OpenClaw Agent integration (deferred)
+    dgclaw_executor.py # DGClaw direct ACP executor (recommended)
+    openclaw_agent.py  # OpenClaw NL AI integration (legacy)
   alerts/
     notifier.py        # Telegram + webhook notifications
 frontend/

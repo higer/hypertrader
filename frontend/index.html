@@ -449,7 +449,7 @@ select.field-input { cursor: pointer; }
 
     <!-- ====== AGENT PAGE ====== -->
     <div id="page-agent" class="page">
-      <h2 class="font-display font-bold text-lg mb-4">OpenClaw Agent</h2>
+      <h2 class="font-display font-bold text-lg mb-4">Execution Agent</h2>
       <div class="grid grid-cols-1 lg:grid-cols-2 gap-4 mb-4">
         <div class="card p-5">
           <div class="text-[11px] text-muted uppercase tracking-wider mb-3">Connection Status</div>
@@ -457,19 +457,35 @@ select.field-input { cursor: pointer; }
             <span id="agent-status-dot" class="w-3 h-3 rounded-full bg-muted"></span>
             <span id="agent-status-text" class="text-sm">Unknown</span>
           </div>
-          <div class="text-[12px] text-muted mb-4">Endpoint: <span id="agent-endpoint-display" class="text-textDim">—</span></div>
-          <button onclick="checkAgentStatus()" class="btn-ghost">Check Status</button>
+          <div class="text-[12px] text-muted mb-1">Executor: <span id="agent-executor-type" class="text-cyan font-mono">—</span></div>
+          <div class="text-[12px] text-muted mb-1">Wallet: <span id="agent-wallet-display" class="text-textDim font-mono">—</span></div>
+          <div class="text-[12px] text-muted mb-4">Trader: <span id="agent-endpoint-display" class="text-textDim font-mono">—</span></div>
+          <div class="flex gap-2">
+            <button onclick="checkAgentStatus()" class="btn-ghost">Check Status</button>
+            <button onclick="loadDGClawPositions()" class="btn-ghost">Live Positions</button>
+            <button onclick="loadDGClawAccount()" class="btn-ghost">Account</button>
+          </div>
         </div>
         <div class="card p-5">
           <div class="text-[11px] text-muted uppercase tracking-wider mb-3">Agent Details</div>
           <pre id="agent-detail-json" class="text-[11px] text-textDim bg-void p-3 rounded max-h-[150px] overflow-auto">No data</pre>
         </div>
       </div>
+      <!-- DGClaw Live Positions -->
+      <div id="dgclaw-positions-card" class="card p-4 mb-4" style="display:none">
+        <div class="text-[11px] text-muted uppercase tracking-wider mb-3">DGClaw Live Positions (On-Chain)</div>
+        <div class="overflow-x-auto">
+          <table class="data-table"><thead><tr>
+            <th>Pair</th><th>Side</th><th>Size</th><th>Entry</th><th>Mark</th><th>PnL</th><th>Leverage</th><th>Liq. Price</th>
+          </tr></thead><tbody id="dgclaw-positions-body"></tbody></table>
+          <div id="dgclaw-positions-empty" class="text-center py-4 text-muted text-[12px]">Click "Live Positions" to load</div>
+        </div>
+      </div>
       <div class="card p-4">
         <div class="text-[11px] text-muted uppercase tracking-wider mb-3">Order Log</div>
         <div class="overflow-x-auto">
           <table class="data-table"><thead><tr>
-            <th>Time</th><th>URL</th><th>Action</th><th>Status</th><th>Response</th>
+            <th>Time</th><th>Action</th><th>Coin</th><th>Direction</th><th>Job ID</th><th>Status</th><th>Details</th>
           </tr></thead><tbody id="order-log-body"></tbody></table>
           <div id="order-log-empty" class="text-center py-6 text-muted text-[12px]">No orders sent</div>
         </div>
@@ -954,12 +970,20 @@ function renderConfig() {
       {k:'telegram_chat_id', label:'Telegram Chat ID', type:'text'},
       {k:'dingtalk_webhook', label:'DingTalk Webhook', type:'text'},
     ]},
-    { key:'openclaw', title:'OpenClaw Agent', icon:'🤖', fields: [
+    { key:'openclaw', title:'OpenClaw Agent (Legacy)', icon:'🤖', fields: [
       {k:'agent_endpoint', label:'Agent Endpoint', type:'text'},
       {k:'api_key', label:'API Key', type:'password'},
       {k:'timeout', label:'Timeout (s)', type:'number', step:1},
       {k:'poll_interval', label:'Poll Interval (s)', type:'number', step:0.5},
       {k:'max_poll_attempts', label:'Max Poll Attempts', type:'number', step:1},
+    ]},
+    { key:'dgclaw', title:'DGClaw Direct Executor', icon:'⚡', fields: [
+      {k:'enabled', label:'Enable DGClaw (bypass OpenClaw AI)', type:'toggle'},
+      {k:'api_key', label:'DGClaw API Key', type:'password'},
+      {k:'poll_interval', label:'ACP Job Poll Interval (s)', type:'number', step:0.5},
+      {k:'max_poll_attempts', label:'Max Poll Attempts', type:'number', step:1},
+      {k:'job_create_timeout', label:'Job Create Timeout (s)', type:'number', step:1},
+      {k:'max_auto_pay_usd', label:'Max Auto-Pay Fee ($)', type:'number', step:0.01},
     ]},
   ];
 
@@ -976,7 +1000,7 @@ function renderConfig() {
               <div class="text-[11px] text-muted mt-1">
                 ${c.dry_run !== false
                   ? 'Signals are generated and logged, but NO real orders are sent to the Agent.'
-                  : 'WARNING: Orders will be sent to OpenClaw Agent for REAL execution on Hyperliquid.'}
+                  : 'WARNING: Orders will be sent via DGClaw ACP for REAL execution on Hyperliquid.'}
               </div>
             </div>
             <label class="toggle" style="width:52px;height:28px">
@@ -1098,19 +1122,57 @@ async function saveConfig() {
 // ================================================================
 async function checkAgentStatus() {
   const data = await api('/api/agent/status');
-  if(data && !data.error) {
+  if(data && !data.error && data.connected) {
     $('agent-status-dot').className = 'w-3 h-3 rounded-full bg-profit';
     $('agent-status-text').textContent = 'Connected';
     $('agent-status-text').className = 'text-sm text-profit';
     $('agent-dot').className = 'w-2 h-2 rounded-full bg-profit';
   } else {
     $('agent-status-dot').className = 'w-3 h-3 rounded-full bg-loss';
-    $('agent-status-text').textContent = 'Offline — ' + (data?.error || 'unreachable');
+    $('agent-status-text').textContent = data?.status === 'dry_run' ? 'Dry Run (disabled)' : 'Offline — ' + (data?.error || data?.message || 'unreachable');
     $('agent-status-text').className = 'text-sm text-loss';
     $('agent-dot').className = 'w-2 h-2 rounded-full bg-loss';
   }
   $('agent-detail-json').textContent = JSON.stringify(data, null, 2);
-  $('agent-endpoint-display').textContent = config?.openclaw?.agent_endpoint || '—';
+  // Display executor type and wallet
+  const execType = data?.executor || (config?.dgclaw?.enabled ? 'dgclaw' : 'openclaw');
+  $('agent-executor-type').textContent = execType === 'dgclaw' ? 'DGClaw (Direct ACP)' : 'OpenClaw (AI Gateway)';
+  $('agent-wallet-display').textContent = data?.wallet || '—';
+  $('agent-endpoint-display').textContent = data?.trader_wallet || config?.openclaw?.agent_endpoint || '—';
+  // Show positions card if dgclaw
+  if(execType === 'dgclaw') { $('dgclaw-positions-card').style.display = 'block'; }
+}
+
+async function loadDGClawPositions() {
+  const data = await api('/api/dgclaw/positions');
+  if(!data || data.error) {
+    $('dgclaw-positions-empty').textContent = data?.error || 'Failed to load';
+    $('dgclaw-positions-empty').style.display = 'block';
+    $('dgclaw-positions-body').innerHTML = '';
+    return;
+  }
+  $('dgclaw-positions-card').style.display = 'block';
+  const positions = Array.isArray(data) ? data : (data.positions || []);
+  $('dgclaw-positions-empty').style.display = positions.length ? 'none' : 'block';
+  $('dgclaw-positions-body').innerHTML = positions.map(p => {
+    const pnl = parseFloat(p.unrealizedPnl || p.pnl || 0);
+    const pnlCls = pnl >= 0 ? 'text-profit' : 'text-loss';
+    return `<tr>
+      <td class="font-mono">${p.pair || p.coin || '—'}</td>
+      <td class="${(p.side||'').toLowerCase()==='long' ? 'text-cyan' : 'text-loss'}">${(p.side||'—').toUpperCase()}</td>
+      <td class="font-mono">$${parseFloat(p.size||p.sizeUsd||0).toFixed(0)}</td>
+      <td class="font-mono">${parseFloat(p.entryPrice||p.entry||0).toFixed(4)}</td>
+      <td class="font-mono">${parseFloat(p.markPrice||p.mark||0).toFixed(4)}</td>
+      <td class="${pnlCls} font-mono">${pnl >= 0 ? '+' : ''}${pnl.toFixed(2)}</td>
+      <td>${p.leverage || '—'}×</td>
+      <td class="text-muted font-mono">${parseFloat(p.liquidationPrice||p.liq||0).toFixed(4)}</td>
+    </tr>`;
+  }).join('');
+}
+
+async function loadDGClawAccount() {
+  const data = await api('/api/dgclaw/account');
+  $('agent-detail-json').textContent = JSON.stringify(data, null, 2);
 }
 
 async function refreshOrderLog() {
@@ -1118,13 +1180,20 @@ async function refreshOrderLog() {
   if(!data) return;
   const orders = data.orders || [];
   $('order-log-empty').style.display = orders.length ? 'none' : 'block';
-  $('order-log-body').innerHTML = orders.slice().reverse().slice(0, 50).map(o => `<tr>
-    <td class="text-muted text-[11px]">${o.ts ? new Date(o.ts*1000).toLocaleTimeString() : '—'}</td>
-    <td class="text-[11px]">${o.url || '—'}</td>
-    <td class="text-[11px]">${o.payload?.action || '—'}</td>
-    <td class="${o.error ? 'text-loss' : 'text-profit'}">${o.error ? 'ERR' : o.status || '—'}</td>
-    <td class="text-[11px] text-muted max-w-[200px] truncate">${o.error || JSON.stringify(o.response||{}).slice(0,80)}</td>
-  </tr>`).join('');
+  $('order-log-body').innerHTML = orders.slice().reverse().slice(0, 50).map(o => {
+    const status = o.error ? 'ERR' : (o.result?.status || o.status || '—');
+    const statusCls = o.error ? 'text-loss' : (status === 'completed' ? 'text-profit' : 'text-muted');
+    const details = o.error || o.result?.deliverable || o.result?.error || JSON.stringify(o.result||o.response||{}).slice(0,100);
+    return `<tr>
+      <td class="text-muted text-[11px]">${o.ts ? new Date(o.ts*1000).toLocaleTimeString() : '—'}</td>
+      <td class="text-[11px] font-mono">${o.action || o.payload?.action || '—'}</td>
+      <td class="text-[11px] font-mono">${o.coin || '—'}</td>
+      <td class="${(o.direction||'')=='long' ? 'text-cyan' : 'text-loss'} text-[11px]">${(o.direction||'—').toUpperCase()}</td>
+      <td class="text-[11px] text-muted font-mono">${o.job_id || '—'}</td>
+      <td class="${statusCls} text-[11px]">${status}</td>
+      <td class="text-[11px] text-muted max-w-[200px] truncate">${(details||'').toString().slice(0,120)}</td>
+    </tr>`;
+  }).join('');
 }
 
 // ================================================================

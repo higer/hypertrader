@@ -96,6 +96,18 @@ class OpenClawConfig(BaseModel):
     max_poll_attempts: int = 30 # max polls before timeout
     confirm_before_execute: bool = True  # require confirmation for large trades
 
+class DGClawConfig(BaseModel):
+    enabled: bool = Field(True, description="Use DGClaw direct executor instead of OpenClaw")
+    api_key: Optional[str] = Field(
+        default_factory=lambda: os.getenv("DGCLAW_API_KEY"),
+        description="DGClaw API key for leaderboard/forum"
+    )
+    poll_interval: float = Field(3.0, description="Seconds between ACP job status polls")
+    max_poll_attempts: int = Field(60, description="Max polls before timeout (60×3s = 3min)")
+    job_create_timeout: float = Field(30.0, description="Timeout for acp job create command")
+    max_auto_pay_usd: float = Field(0.05, description="Max ACP fee to auto-approve ($)")
+    confirm_before_execute: bool = Field(False, description="Require confirmation (disabled for HFT)")
+
 class SystemConfig(BaseModel):
     dry_run: bool = True                     # True = no real execution, signals only
     risk: RiskConfig = RiskConfig()
@@ -105,6 +117,7 @@ class SystemConfig(BaseModel):
     funding_arb: FundingArbConfig = FundingArbConfig()
     alert: AlertConfig = AlertConfig()
     openclaw: OpenClawConfig = OpenClawConfig()
+    dgclaw: DGClawConfig = DGClawConfig()
     top_n: int = DEFAULT_TOP_N
     candle_interval: str = "15m"            # 1m,5m,15m,1h,4h,1d
     data_lookback_bars: int = 200
