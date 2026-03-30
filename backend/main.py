@@ -284,6 +284,10 @@ async def update_config(body: ConfigUpdate):
         state["collector"].candle_store.interval = new_cfg.candle_interval
         state["collector"].candle_store.lookback = new_cfg.data_lookback_bars
         state["risk"].cfg = new_cfg.risk
+        # Sync equity if initial_equity changed
+        old_equity_cfg = state["cfg"].risk.initial_equity
+        if new_cfg.risk.initial_equity != old_equity_cfg:
+            state["risk"].reset_equity(new_cfg.risk.initial_equity)
         state["engine"] = StrategyEngine(new_cfg, state["collector"], state["risk"])
 
         # Hot-swap executor if type changed

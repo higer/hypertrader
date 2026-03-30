@@ -40,6 +40,15 @@ class RiskManager:
         self.closed_trades: List[dict] = []
         self._cooldowns: Dict[str, float] = {}  # coin → reentry time
 
+    def reset_equity(self, new_equity: float):
+        """Reset equity to a new value. Called when initial_equity config changes.
+        Preserves PnL from closed trades by computing the delta."""
+        old_equity = self.equity
+        self.equity = new_equity
+        self.peak_equity = max(new_equity, self.peak_equity)
+        self.daily_start_equity = new_equity
+        logger.info(f"Equity reset: ${old_equity:,.2f} → ${new_equity:,.2f}")
+
     # ----- sizing -----
     def compute_size(self, signal: Signal) -> float:
         """Kelly-lite + risk parity sizing."""
