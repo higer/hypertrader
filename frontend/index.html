@@ -979,7 +979,9 @@ function renderConfig() {
     ]},
     { key:'dgclaw', title:'DGClaw Direct Executor', icon:'⚡', fields: [
       {k:'enabled', label:'Enable DGClaw (bypass OpenClaw AI)', type:'toggle'},
-      {k:'api_key', label:'DGClaw API Key', type:'password'},
+      {k:'acp_api_key', label:'ACP API Key (LITE_AGENT_API_KEY)', type:'password'},
+      {k:'acp_builder_code', label:'ACP Builder Code', type:'password'},
+      {k:'api_key', label:'DGClaw Leaderboard API Key', type:'password'},
       {k:'poll_interval', label:'ACP Job Poll Interval (s)', type:'number', step:0.5},
       {k:'max_poll_attempts', label:'Max Poll Attempts', type:'number', step:1},
       {k:'job_create_timeout', label:'Job Create Timeout (s)', type:'number', step:1},

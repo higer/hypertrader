@@ -1,18 +1,20 @@
 """
 Degenerate Claw (dgclaw) direct executor — bypasses OpenClaw AI processing
-and sends structured ACP job commands directly to the Degen Claw Trader agent.
+and sends structured ACP job commands directly to the Degen Claw Trader agent
+via the ACP REST API (pure HTTP, no CLI subprocess dependency).
 
-This eliminates AI thinking overhead and endpoint routing issues, enabling
-high-frequency trading execution.
+This eliminates AI thinking overhead, endpoint routing issues, and the
+`npx tsx` dependency, enabling high-frequency trading execution.
 
 Flow:
   1. Convert structured command → ACP perp_trade JSON payload
-  2. Create ACP job via `acp job create` subprocess
-  3. Auto-approve payment in NEGOTIATION phase
-  4. Poll job status until COMPLETED / REJECTED / EXPIRED
-  5. Return structured result
+  2. POST to ACP API to create job
+  3. Poll job status, auto-approve payment in NEGOTIATION phase
+  4. Return structured result on COMPLETED / REJECTED / EXPIRED
 
-Constants:
+API:
+  - ACP API: https://claw-api.virtuals.io
+  - Auth: x-api-key (LITE_AGENT_API_KEY from `acp setup`)
   - Degen Claw Trader wallet: 0xd478a8B40372db16cA8045F28C6FE07228F3781A
   - Trading resource API: https://dgclaw-trader.virtuals.io
   - ACP service fee: ~$0.01 per job
@@ -20,8 +22,9 @@ Constants:
 
 import asyncio
 import json
+import os
 import time
-from typing import Optional, Dict, List
+from typing import Optional, List
 
 import aiohttp
 from loguru import logger
@@ -34,54 +37,63 @@ from config import DGClawConfig
 
 DGCLAW_TRADER_WALLET = "0xd478a8B40372db16cA8045F28C6FE07228F3781A"
 DGCLAW_RESOURCE_BASE = "https://dgclaw-trader.virtuals.io"
+ACP_API_BASE = "https://claw-api.virtuals.io"
 
 
 # ---------------------------------------------------------------------------
-# ACP subprocess helpers (async, non-blocking)
+# Helper: load ACP API key from openclaw-acp config.json
 # ---------------------------------------------------------------------------
 
-async def _run_acp(*args, timeout: float = 30) -> dict:
-    """Run an `acp` CLI command and return parsed JSON output."""
-    cmd = ["acp"] + list(args) + ["--json"]
-    logger.debug(f"ACP cmd: {' '.join(cmd)}")
+def _load_acp_api_key() -> Optional[str]:
+    """
+    Load LITE_AGENT_API_KEY from environment or openclaw-acp config.json.
+    The `acp setup` command stores the key in <openclaw-acp>/config.json.
+    """
+    # 1. Environment variable (highest priority)
+    key = os.getenv("LITE_AGENT_API_KEY", "").strip()
+    if key:
+        return key
 
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await asyncio.wait_for(
-            proc.communicate(), timeout=timeout
-        )
-
-        out_text = stdout.decode().strip()
-        err_text = stderr.decode().strip()
-
-        if proc.returncode != 0:
-            logger.error(f"ACP error (rc={proc.returncode}): {err_text}")
-            return {"error": f"ACP exit code {proc.returncode}: {err_text}"}
-
-        if not out_text:
-            return {"error": "ACP returned empty output"}
-
-        # Parse JSON — acp --json outputs JSON
+    # 2. Try common config.json locations
+    candidates = [
+        os.path.expanduser("~/openclaw-acp/config.json"),
+        os.path.expanduser("~/.openclaw/config.json"),
+        "/workspace/openclaw-acp/config.json",
+    ]
+    for path in candidates:
         try:
-            return json.loads(out_text)
-        except json.JSONDecodeError:
-            # Sometimes output has non-JSON preamble; try last line
-            for line in reversed(out_text.splitlines()):
-                line = line.strip()
-                if line.startswith("{") or line.startswith("["):
-                    return json.loads(line)
-            return {"raw": out_text}
+            with open(path) as f:
+                cfg = json.load(f)
+            key = cfg.get("LITE_AGENT_API_KEY", "").strip()
+            if key:
+                logger.info(f"ACP API key loaded from {path}")
+                return key
+        except (FileNotFoundError, json.JSONDecodeError, KeyError):
+            continue
 
-    except asyncio.TimeoutError:
-        return {"error": f"ACP command timed out after {timeout}s"}
-    except FileNotFoundError:
-        return {"error": "acp CLI not found — install openclaw-acp first"}
-    except Exception as e:
-        return {"error": f"ACP subprocess error: {e}"}
+    return None
+
+
+def _load_acp_builder_code() -> Optional[str]:
+    """Load ACP_BUILDER_CODE from environment or config."""
+    code = os.getenv("ACP_BUILDER_CODE", "").strip()
+    if code:
+        return code
+    candidates = [
+        os.path.expanduser("~/openclaw-acp/config.json"),
+        os.path.expanduser("~/.openclaw/config.json"),
+        "/workspace/openclaw-acp/config.json",
+    ]
+    for path in candidates:
+        try:
+            with open(path) as f:
+                cfg = json.load(f)
+            code = cfg.get("ACP_BUILDER_CODE", "").strip()
+            if code:
+                return code
+        except (FileNotFoundError, json.JSONDecodeError):
+            continue
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -93,49 +105,168 @@ class DGClawExecutor:
     def __init__(self, cfg: DGClawConfig):
         self.cfg = cfg
         self.order_log: List[dict] = []
-        self._session: Optional[aiohttp.ClientSession] = None
+        self._acp_session: Optional[aiohttp.ClientSession] = None  # ACP API
+        self._res_session: Optional[aiohttp.ClientSession] = None  # resource API
         self._connected: Optional[bool] = None
-        self._wallet: Optional[str] = None  # our wallet, discovered via acp whoami
+        self._wallet: Optional[str] = None
+        self._acp_api_key: Optional[str] = None
+        self._acp_builder_code: Optional[str] = None
 
-    async def _ensure_session(self):
-        if self._session is None or self._session.closed:
-            headers = {}
-            if self.cfg.api_key:
-                headers["Authorization"] = f"Bearer {self.cfg.api_key}"
-            self._session = aiohttp.ClientSession(headers=headers)
+    async def _ensure_acp_session(self):
+        """Create/reuse the ACP API HTTP session with auth headers."""
+        if self._acp_session and not self._acp_session.closed:
+            return
+
+        # Load API key
+        if not self._acp_api_key:
+            self._acp_api_key = (
+                self.cfg.acp_api_key
+                or _load_acp_api_key()
+            )
+        if not self._acp_builder_code:
+            self._acp_builder_code = (
+                self.cfg.acp_builder_code
+                or _load_acp_builder_code()
+            )
+
+        if not self._acp_api_key:
+            raise RuntimeError(
+                "ACP API key not found. Set LITE_AGENT_API_KEY env var "
+                "or run `acp setup` in openclaw-acp."
+            )
+
+        headers = {
+            "Content-Type": "application/json",
+            "x-api-key": self._acp_api_key,
+        }
+        if self._acp_builder_code:
+            headers["x-builder-code"] = self._acp_builder_code
+
+        base = os.getenv("ACP_API_URL", ACP_API_BASE).rstrip("/")
+        self._acp_session = aiohttp.ClientSession(
+            base_url=base,
+            headers=headers,
+        )
+
+    async def _ensure_res_session(self):
+        """Create/reuse the resource query HTTP session."""
+        if self._res_session and not self._res_session.closed:
+            return
+        headers = {}
+        if self.cfg.api_key:
+            headers["Authorization"] = f"Bearer {self.cfg.api_key}"
+        self._res_session = aiohttp.ClientSession(headers=headers)
 
     async def close(self):
-        if self._session and not self._session.closed:
-            await self._session.close()
+        for s in (self._acp_session, self._res_session):
+            if s and not s.closed:
+                await s.close()
+
+    # ------------------------------------------------------------------
+    # ACP REST helpers
+    # ------------------------------------------------------------------
+
+    async def _acp_post(self, path: str, payload: dict,
+                        timeout: float = 30) -> dict:
+        """POST to ACP API and return parsed response."""
+        await self._ensure_acp_session()
+        try:
+            async with self._acp_session.post(
+                path, json=payload,
+                timeout=aiohttp.ClientTimeout(total=timeout),
+            ) as r:
+                body = await r.json()
+                if r.status >= 400:
+                    error_msg = json.dumps(body) if isinstance(body, dict) else str(body)
+                    logger.error(f"ACP POST {path} → {r.status}: {error_msg[:300]}")
+                    return {"error": f"HTTP {r.status}: {error_msg[:300]}"}
+                return body
+        except aiohttp.ClientError as e:
+            return {"error": f"ACP connection error: {e}"}
+        except asyncio.TimeoutError:
+            return {"error": f"ACP request to {path} timed out"}
+        except Exception as e:
+            return {"error": f"ACP request error: {e}"}
+
+    async def _acp_get(self, path: str, timeout: float = 15) -> dict:
+        """GET from ACP API."""
+        await self._ensure_acp_session()
+        try:
+            async with self._acp_session.get(
+                path, timeout=aiohttp.ClientTimeout(total=timeout),
+            ) as r:
+                body = await r.json()
+                if r.status >= 400:
+                    error_msg = json.dumps(body) if isinstance(body, dict) else str(body)
+                    return {"error": f"HTTP {r.status}: {error_msg[:300]}"}
+                return body
+        except aiohttp.ClientError as e:
+            return {"error": f"ACP connection error: {e}"}
+        except asyncio.TimeoutError:
+            return {"error": f"ACP GET {path} timed out"}
+        except Exception as e:
+            return {"error": f"ACP request error: {e}"}
+
+    # ------------------------------------------------------------------
+    # Identity
+    # ------------------------------------------------------------------
 
     async def _get_wallet(self) -> Optional[str]:
-        """Get our wallet address from acp whoami (cached)."""
+        """Get our wallet address via GET /acp/me (cached)."""
         if self._wallet:
             return self._wallet
-        result = await _run_acp("whoami")
+        result = await self._acp_get("/acp/me")
         if "error" not in result:
-            self._wallet = result.get("walletAddress") or result.get("address")
+            data = result.get("data", result)
+            self._wallet = data.get("walletAddress") or data.get("address")
             if self._wallet:
                 logger.info(f"ACP wallet: {self._wallet}")
         return self._wallet
 
     # ------------------------------------------------------------------
-    # ACP job lifecycle
+    # ACP job lifecycle (pure HTTP)
     # ------------------------------------------------------------------
 
     async def _create_job(self, operation: str, requirements: dict) -> dict:
-        """Create an ACP job targeting the Degen Claw Trader."""
-        req_json = json.dumps(requirements, separators=(",", ":"))
-        result = await _run_acp(
-            "job", "create",
-            DGCLAW_TRADER_WALLET,
-            operation,
-            "--requirements", req_json,
-            timeout=self.cfg.job_create_timeout,
+        """
+        Create an ACP job targeting the Degen Claw Trader.
+        POST /acp/jobs
+        """
+        payload = {
+            "providerWalletAddress": DGCLAW_TRADER_WALLET,
+            "jobOfferingName": operation,
+            "serviceRequirements": requirements,
+        }
+        logger.debug(f"ACP create job: {operation} → {json.dumps(requirements)}")
+        result = await self._acp_post(
+            "/acp/jobs", payload, timeout=self.cfg.job_create_timeout
         )
+
+        # Extract jobId from response: { data: { jobId: N } }
+        if "error" not in result:
+            data = result.get("data", result)
+            job_id = data.get("jobId") or data.get("id")
+            if job_id:
+                return {"jobId": job_id}
+            return {"error": "No jobId in response", "raw": result}
         return result
 
-    async def _poll_job(self, job_id: str) -> dict:
+    async def _get_job_status(self, job_id) -> dict:
+        """GET /acp/jobs/{jobId}"""
+        result = await self._acp_get(f"/acp/jobs/{job_id}")
+        if "error" not in result:
+            return result.get("data", result)
+        return result
+
+    async def _approve_payment(self, job_id) -> dict:
+        """POST /acp/providers/jobs/{jobId}/negotiation"""
+        return await self._acp_post(
+            f"/acp/providers/jobs/{job_id}/negotiation",
+            {"accept": True},
+            timeout=30,
+        )
+
+    async def _poll_job(self, job_id) -> dict:
         """
         Poll an ACP job until terminal state.
         Auto-approves payment in NEGOTIATION phase.
@@ -143,7 +274,7 @@ class DGClawExecutor:
         for attempt in range(self.cfg.max_poll_attempts):
             await asyncio.sleep(self.cfg.poll_interval)
 
-            status = await _run_acp("job", "status", str(job_id))
+            status = await self._get_job_status(job_id)
             if "error" in status:
                 logger.warning(f"Poll error (attempt {attempt+1}): {status['error']}")
                 continue
@@ -174,7 +305,13 @@ class DGClawExecutor:
             elif phase == "NEGOTIATION":
                 # Auto-approve payment (typically $0.01 ACP fee)
                 payment = status.get("paymentRequestData", {})
-                amount = payment.get("amountUsd", 0)
+                amount = 0
+                if isinstance(payment, dict):
+                    amount = payment.get("amountUsd", 0)
+                    if not amount:
+                        budget = payment.get("budget", {})
+                        amount = budget.get("amount", 0) if isinstance(budget, dict) else 0
+
                 if amount > self.cfg.max_auto_pay_usd:
                     logger.error(
                         f"Job {job_id} payment ${amount} exceeds "
@@ -187,10 +324,7 @@ class DGClawExecutor:
                     }
 
                 logger.info(f"Job {job_id} auto-paying ${amount}")
-                pay_result = await _run_acp(
-                    "job", "pay", str(job_id), "--accept", "true",
-                    timeout=30,
-                )
+                pay_result = await self._approve_payment(job_id)
                 if "error" in pay_result:
                     logger.error(f"Payment failed: {pay_result['error']}")
 
@@ -204,11 +338,10 @@ class DGClawExecutor:
 
     @staticmethod
     def _get_phase(status: dict) -> str:
-        """Extract the current phase, preferring memoHistory over top-level."""
-        memo = status.get("memoHistory", [])
-        if memo:
-            # Latest memo entry has the most recent phase
-            last = memo[-1] if isinstance(memo, list) else memo
+        """Extract the current phase, preferring memos over top-level."""
+        memos = status.get("memos", status.get("memoHistory", []))
+        if memos and isinstance(memos, list):
+            last = memos[-1]
             if isinstance(last, dict):
                 next_phase = last.get("nextPhase", "")
                 if next_phase:
@@ -217,9 +350,9 @@ class DGClawExecutor:
 
     @staticmethod
     def _get_rejection_reason(status: dict) -> str:
-        memo = status.get("memoHistory", [])
-        if memo and isinstance(memo, list):
-            for entry in reversed(memo):
+        memos = status.get("memos", status.get("memoHistory", []))
+        if memos and isinstance(memos, list):
+            for entry in reversed(memos):
                 content = entry.get("content", "")
                 if content:
                     return str(content)[:300]
@@ -303,7 +436,7 @@ class DGClawExecutor:
             self._append_log(record)
             return result
 
-        job_id = result.get("jobId") or result.get("id") or result.get("job_id")
+        job_id = result.get("jobId")
         if not job_id:
             record["error"] = "No job ID returned"
             self._append_log(record)
@@ -340,7 +473,7 @@ class DGClawExecutor:
             self._append_log(record)
             return result
 
-        job_id = result.get("jobId") or result.get("id") or result.get("job_id")
+        job_id = result.get("jobId")
         if not job_id:
             record["error"] = "No job ID returned"
             self._append_log(record)
@@ -371,7 +504,7 @@ class DGClawExecutor:
         if "error" in result:
             return result
 
-        job_id = result.get("jobId") or result.get("id")
+        job_id = result.get("jobId")
         if not job_id:
             return {"error": "No job ID in ACP response", "raw": result}
 
@@ -385,7 +518,7 @@ class DGClawExecutor:
         """Query live open positions from dgclaw-trader API."""
         wallet = await self._get_wallet()
         if not wallet:
-            return {"error": "Wallet address unknown — run `acp whoami`"}
+            return {"error": "Wallet address unknown — set LITE_AGENT_API_KEY"}
         return await self._resource_get(f"/users/{wallet}/positions")
 
     async def get_account(self) -> dict:
@@ -411,10 +544,10 @@ class DGClawExecutor:
 
     async def _resource_get(self, path: str) -> dict:
         """GET from dgclaw-trader.virtuals.io resource API."""
-        await self._ensure_session()
+        await self._ensure_res_session()
         url = f"{DGCLAW_RESOURCE_BASE}{path}"
         try:
-            async with self._session.get(
+            async with self._res_session.get(
                 url, timeout=aiohttp.ClientTimeout(total=15)
             ) as r:
                 if r.status >= 400:
@@ -429,23 +562,34 @@ class DGClawExecutor:
     # ------------------------------------------------------------------
 
     async def get_agent_status(self) -> dict:
-        """Check ACP connectivity and account status."""
-        # 1. Check acp whoami
-        whoami = await _run_acp("whoami")
-        if "error" in whoami:
+        """Check ACP connectivity and account status via REST API."""
+        try:
+            result = await self._acp_get("/acp/me")
+        except RuntimeError as e:
+            # API key not configured
             self._connected = False
             return {
                 "status": "disconnected",
                 "connected": False,
-                "error": whoami["error"],
-                "message": "ACP CLI not available or not configured",
+                "error": str(e),
+                "message": "ACP API key not configured",
             }
 
-        wallet = whoami.get("walletAddress") or whoami.get("address", "unknown")
+        if "error" in result:
+            self._connected = False
+            return {
+                "status": "disconnected",
+                "connected": False,
+                "error": result["error"],
+                "message": "Cannot reach ACP API",
+            }
+
+        data = result.get("data", result)
+        wallet = data.get("walletAddress") or data.get("address", "unknown")
         self._wallet = wallet
         self._connected = True
 
-        # 2. Try to get account balance
+        # Get account balance and positions
         account = await self.get_account()
         positions = await self.get_positions()
 
@@ -454,10 +598,12 @@ class DGClawExecutor:
             "connected": True,
             "executor": "dgclaw",
             "wallet": wallet,
+            "agent_name": data.get("name", ""),
             "trader_wallet": DGCLAW_TRADER_WALLET,
             "account": account if "error" not in account else None,
             "positions": positions if "error" not in positions else None,
             "resource_api": DGCLAW_RESOURCE_BASE,
+            "acp_api": ACP_API_BASE,
         }
 
     # ------------------------------------------------------------------

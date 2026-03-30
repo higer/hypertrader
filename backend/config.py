@@ -102,9 +102,17 @@ class DGClawConfig(BaseModel):
         default_factory=lambda: os.getenv("DGCLAW_API_KEY"),
         description="DGClaw API key for leaderboard/forum"
     )
+    acp_api_key: Optional[str] = Field(
+        default_factory=lambda: os.getenv("LITE_AGENT_API_KEY"),
+        description="ACP API key from `acp setup` (LITE_AGENT_API_KEY)"
+    )
+    acp_builder_code: Optional[str] = Field(
+        default_factory=lambda: os.getenv("ACP_BUILDER_CODE"),
+        description="ACP builder code (optional)"
+    )
     poll_interval: float = Field(3.0, description="Seconds between ACP job status polls")
     max_poll_attempts: int = Field(60, description="Max polls before timeout (60×3s = 3min)")
-    job_create_timeout: float = Field(30.0, description="Timeout for acp job create command")
+    job_create_timeout: float = Field(30.0, description="Timeout for ACP job create request")
     max_auto_pay_usd: float = Field(0.05, description="Max ACP fee to auto-approve ($)")
     confirm_before_execute: bool = Field(False, description="Require confirmation (disabled for HFT)")
 
