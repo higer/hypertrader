@@ -51,10 +51,12 @@ class RiskManager:
 
     # ----- sizing -----
     def compute_size(self, signal: Signal) -> float:
-        """Kelly-lite + risk parity sizing."""
-        risk_per_trade = self.equity * self.cfg.max_position_pct
+        """Kelly-lite + risk parity sizing.
+        Guarantees: size <= equity * max_position_pct (hard cap)."""
+        hard_cap = self.equity * self.cfg.max_position_pct
+        risk_per_trade = hard_cap
         if signal.size_hint_pct > 0:
-            risk_per_trade = self.equity * signal.size_hint_pct
+            risk_per_trade = self.equity * min(signal.size_hint_pct, self.cfg.max_position_pct)
 
         # Scale by strength
         risk_per_trade *= max(0.3, signal.strength)
@@ -66,6 +68,14 @@ class RiskManager:
                 raw = risk_per_trade / dist * signal.entry_price
                 risk_per_trade = min(risk_per_trade, raw)
 
+        # Hard cap: never exceed max_position_pct of equity
+        risk_per_trade = min(risk_per_trade, hard_cap)
+
+        # Also never exceed total equity (safety net)
+        risk_per_trade = min(risk_per_trade, self.equity)
+
+        logger.debug(f"Size for {signal.coin}: ${risk_per_trade:.2f} "
+                     f"(equity=${self.equity:.0f}, cap=${hard_cap:.0f})")
         return round(risk_per_trade, 2)
 
     # ----- checks -----

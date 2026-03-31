@@ -278,6 +278,9 @@ async def update_config(body: ConfigUpdate):
         new_cfg = SystemConfig.model_validate(body.config)
         new_cfg.save(CONFIG_PATH)
 
+        # Capture old equity BEFORE overwriting state
+        old_equity = state["cfg"].risk.initial_equity
+
         state["cfg"] = new_cfg
         state["collector"].cfg = new_cfg
         state["collector"].market_filter.top_n = new_cfg.top_n
@@ -285,9 +288,9 @@ async def update_config(body: ConfigUpdate):
         state["collector"].candle_store.lookback = new_cfg.data_lookback_bars
         state["risk"].cfg = new_cfg.risk
         # Sync equity if initial_equity changed
-        old_equity_cfg = state["cfg"].risk.initial_equity
-        if new_cfg.risk.initial_equity != old_equity_cfg:
+        if new_cfg.risk.initial_equity != old_equity:
             state["risk"].reset_equity(new_cfg.risk.initial_equity)
+            logger.info(f"Equity reset: {old_equity} → {new_cfg.risk.initial_equity}")
         state["engine"] = StrategyEngine(new_cfg, state["collector"], state["risk"])
 
         # Hot-swap executor if type changed
