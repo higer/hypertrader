@@ -327,6 +327,69 @@ async def get_positions():
     return {"positions": state["risk"].stats().get("positions", {})}
 
 
+class ClosePositionRequest(BaseModel):
+    coin: str
+    direction: str
+
+@app.post("/api/close-position")
+async def close_position(body: ClosePositionRequest):
+    """Manually close an open position."""
+    risk: RiskManager = state["risk"]
+    collector: DataCollector = state["collector"]
+    cfg: SystemConfig = state["cfg"]
+    notifier: Notifier = state["notifier"]
+
+    # Get current price
+    df = collector.get_df(body.coin)
+    if df.empty:
+        raise HTTPException(400, f"No price data for {body.coin}")
+    current_price = df["close"].iloc[-1]
+
+    record = risk.force_close(body.coin, body.direction, current_price)
+    if not record:
+        raise HTTPException(404, f"No open position for {body.coin} {body.direction}")
+
+    # Build close command for executor
+    cmd = {
+        "action": "close",
+        "coin": body.coin,
+        "direction": body.direction,
+        "reason": "manual_close",
+        "pnl_pct": record["pnl_pct"],
+        "pnl_usd": record["pnl_usd"],
+        "entry": record["entry"],
+        "size_usd": record["size_usd"],
+        "stop_loss": record["stop_loss"],
+        "take_profit": record["take_profit"],
+        "strategy": record["strategy"],
+    }
+
+    await notifier.on_exit(cmd, dry_run=cfg.dry_run)
+
+    # If LIVE mode, send close to executor (ACP)
+    if not cfg.dry_run:
+        try:
+            exec_results = await state["executor"].execute_commands([cmd])
+            for er in exec_results:
+                success = "error" not in er["result"]
+                if not success:
+                    # ACP failed — rollback the close
+                    risk.rollback_exit(record)
+                    await notifier.on_system(
+                        f"Manual close FAILED for {body.coin} — position restored"
+                    )
+                    raise HTTPException(502, f"Executor failed: {er['result'].get('error','?')}")
+                await notifier.on_order(er["cmd"], er["result"])
+        except HTTPException:
+            raise
+        except Exception as e:
+            risk.rollback_exit(record)
+            raise HTTPException(502, f"Executor error: {e}")
+
+    await broadcast({"type": "position_closed", "data": record})
+    return {"message": f"Closed {body.direction} {body.coin}", "trade": record}
+
+
 @app.get("/api/trades")
 async def get_trades():
     return {"trades": state["risk"].closed_trades}

@@ -772,6 +772,28 @@ async function refreshMarket() {
 // ================================================================
 // POSITIONS
 // ================================================================
+async function closePosition(coin, direction) {
+  if (!confirm(`Close ${direction.toUpperCase()} ${coin}?`)) return;
+  try {
+    const res = await fetch('/api/close-position', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({coin, direction})
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      toast(data.detail || 'Close failed', 'error');
+      return;
+    }
+    toast(`Closed ${direction} ${coin} — PnL: ${data.trade.pnl_pct}%`, data.trade.pnl_usd >= 0 ? 'success' : 'error');
+    refreshPositions();
+    refreshDashboard();
+    refreshHistory();
+  } catch(e) {
+    toast('Close request failed: ' + e.message, 'error');
+  }
+}
+
 async function refreshPositions() {
   const data = await api('/api/positions');
   if(!data) return;
@@ -788,8 +810,9 @@ async function refreshPositions() {
       <td class="text-loss">${fmt(p.sl,4)}</td>
       <td class="text-profit">${fmt(p.tp,4)}</td>
       <td class="text-muted">${p.strategy}</td>
-      <td><button class="btn-danger" onclick="toast('Close sent (mock)','info')">Close</button></td>
+      <td><button class="btn-danger" onclick="closePosition('${p.coin}','${p.dir}')">Close</button></td>
     </tr>`;
+  }).join('');
   }).join('');
 }
 

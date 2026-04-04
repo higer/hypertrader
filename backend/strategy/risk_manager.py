@@ -178,6 +178,38 @@ class RiskManager:
         logger.warning(f"ROLLBACK EXIT {direction.upper()} {coin} — "
                       f"ACP close failed, position restored")
 
+    def force_close(self, coin: str, direction: str, current_price: float) -> Optional[dict]:
+        """Manually close a position. Returns exit record or None."""
+        key = f"{coin}_{direction}"
+        pos = self.positions.get(key)
+        if not pos:
+            return None
+
+        pnl_pct = ((current_price - pos.entry_price) / pos.entry_price
+                    if pos.direction == "long"
+                    else (pos.entry_price - current_price) / pos.entry_price)
+        pnl_usd = pos.size_usd * pnl_pct
+        self.equity += pnl_usd
+        self.peak_equity = max(self.peak_equity, self.equity)
+
+        record = {
+            "coin": pos.coin, "direction": pos.direction,
+            "strategy": pos.strategy, "reason": "manual_close",
+            "entry": pos.entry_price, "exit": current_price,
+            "pnl_pct": round(pnl_pct * 100, 2),
+            "pnl_usd": round(pnl_usd, 2),
+            "duration_s": round(time.time() - pos.opened_at, 1),
+            "size_usd": pos.size_usd,
+            "stop_loss": pos.stop_loss,
+            "take_profit": pos.take_profit,
+        }
+        self.closed_trades.append(record)
+        del self.positions[key]
+        self._cooldowns[coin] = time.time() + 180
+        logger.info(f"MANUAL CLOSE {pos.direction.upper()} {pos.coin} "
+                     f"PnL={pnl_pct*100:+.2f}% (${pnl_usd:+.2f})")
+        return record
+
     def check_exits(self, prices: Dict[str, float]) -> List[dict]:
         """Check all open positions for SL/TP/trailing-stop hits."""
         exits = []
