@@ -4,11 +4,12 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>HyperTrader — Hyperliquid Perps Terminal</title>
-<script src="https://cdn.tailwindcss.com"></script>
-<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<script src="https://cdn.tailwindcss.com" onerror="document.head.appendChild(Object.assign(document.createElement('style'),{textContent:'body{font-family:sans-serif;background:#0a0e17;color:#f1f5f9;margin:0}'}))"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js" onerror="window.__chartMissing=true"></script>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600;700&family=Outfit:wght@300;400;500;600;700;800;900&display=swap" rel="stylesheet">
 <script>
+if(typeof tailwind !== 'undefined') {
 tailwind.config = {
   theme: {
     extend: {
@@ -34,6 +35,7 @@ tailwind.config = {
       },
     }
   }
+}
 }
 </script>
 <style>
@@ -595,28 +597,32 @@ function toggleSidebar() {
 // WEBSOCKET
 // ================================================================
 function connectWS() {
-  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-  ws = new WebSocket(`${proto}://${location.host}/ws`);
-  ws.onopen = () => {
-    wsRetry = 0;
-    $('ws-dot').className = 'w-2 h-2 rounded-full bg-profit pulse-dot';
-    $('ws-label').textContent = 'Connected';
-    $('ws-label').className = 'text-profit';
-  };
-  ws.onmessage = (e) => {
-    try {
-      const msg = JSON.parse(e.data);
-      if(msg.type === 'tick') handleTick(msg.data);
-    } catch(err) {}
-  };
-  ws.onclose = () => {
-    $('ws-dot').className = 'w-2 h-2 rounded-full bg-muted pulse-dot';
-    $('ws-label').textContent = 'Disconnected';
-    $('ws-label').className = 'text-muted';
-    wsRetry++;
-    setTimeout(connectWS, Math.min(wsRetry * 2000, 15000));
-  };
-  ws.onerror = () => ws.close();
+  try {
+    const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+    ws = new WebSocket(`${proto}://${location.host}/ws`);
+    ws.onopen = () => {
+      wsRetry = 0;
+      if($('ws-dot')) $('ws-dot').className = 'w-2 h-2 rounded-full bg-profit pulse-dot';
+      if($('ws-label')) { $('ws-label').textContent = 'Connected'; $('ws-label').className = 'text-profit'; }
+    };
+    ws.onmessage = (e) => {
+      try {
+        const msg = JSON.parse(e.data);
+        if(msg.type === 'tick') handleTick(msg.data);
+        if(msg.type === 'position_closed') { refreshPositions(); refreshDashboard(); refreshHistory(); }
+      } catch(err) {}
+    };
+    ws.onclose = () => {
+      if($('ws-dot')) $('ws-dot').className = 'w-2 h-2 rounded-full bg-muted pulse-dot';
+      if($('ws-label')) { $('ws-label').textContent = 'Disconnected'; $('ws-label').className = 'text-muted'; }
+      wsRetry++;
+      setTimeout(connectWS, Math.min(wsRetry * 2000, 15000));
+    };
+    ws.onerror = () => { try { ws.close(); } catch(e) {} };
+  } catch(e) {
+    console.error('WS error:', e);
+    setTimeout(connectWS, 5000);
+  }
 }
 
 function handleTick(data) {
@@ -720,7 +726,7 @@ function renderDashboard() {
 
 function renderEquityChart() {
   const ctx = $('equity-chart');
-  if(!ctx) return;
+  if(!ctx || typeof Chart === 'undefined') return;
   const labels = equityHistory.map((h,i) => i);
   const data = equityHistory.map(h => h.equity);
   if(equityChart) {
@@ -812,7 +818,6 @@ async function refreshPositions() {
       <td class="text-muted">${p.strategy}</td>
       <td><button class="btn-danger" onclick="closePosition('${p.coin}','${p.dir}')">Close</button></td>
     </tr>`;
-  }).join('');
   }).join('');
 }
 
@@ -1093,15 +1098,16 @@ function renderConfig() {
 
 async function saveConfig() {
   // Collect values from DOM
-  const sections = ['risk','momentum','mean_reversion','breakout','funding_arb','alert','openclaw'];
+  const sections = ['risk','momentum','mean_reversion','breakout','funding_arb','alert','openclaw','dgclaw'];
   const fieldTypes = {
-    max_position_pct:'f', max_drawdown_pct:'f', max_open_positions:'i', trailing_stop_pct:'f',
+    initial_equity:'f', max_position_pct:'f', max_drawdown_pct:'f', max_open_positions:'i', trailing_stop_pct:'f',
     daily_loss_limit_pct:'f', leverage:'i', fast_ema:'i', slow_ema:'i', rsi_period:'i',
     rsi_ob:'f', rsi_os:'f', volume_surge_mult:'f', atr_period:'i', atr_sl_mult:'f',
     atr_tp_mult:'f', cooldown_bars:'i', bb_period:'i', bb_std:'f', rsi_entry_low:'f',
     rsi_entry_high:'f', holding_bars_max:'i', lookback:'i', volume_confirm_mult:'f',
     min_consolidation_bars:'i', funding_threshold:'f', holding_hours:'i', max_position_pct:'f',
     timeout:'i', top_n:'i', data_lookback_bars:'i', poll_interval_sec:'i',
+    poll_interval:'f', max_poll_attempts:'i', job_create_timeout:'i', max_auto_pay_usd:'f',
   };
 
   const newCfg = {};
@@ -1234,11 +1240,15 @@ function renderLogs() {
 // INIT
 // ================================================================
 (async function init() {
-  connectWS();
-  await refreshDashboard();
-  // Auto-load market data on startup
-  refreshMarket();
-  addLog('HyperTrader initialised', 'info');
+  try {
+    connectWS();
+    await refreshDashboard();
+    refreshMarket();
+    addLog('HyperTrader initialised', 'info');
+  } catch(e) {
+    console.error('Init error:', e);
+    addLog('Init error: ' + e.message, 'error');
+  }
 })();
 
 // Auto-refresh dashboard every 30s
