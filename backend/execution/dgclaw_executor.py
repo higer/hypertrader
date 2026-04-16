@@ -6,11 +6,12 @@ via the ACP REST API (pure HTTP, no CLI subprocess dependency).
 This eliminates AI thinking overhead, endpoint routing issues, and the
 `npx tsx` dependency, enabling high-frequency trading execution.
 
-Flow:
+Flow (ACP v1.0):
   1. Convert structured command → ACP perp_trade JSON payload
-  2. POST to ACP API to create job
-  3. Poll job status, auto-approve payment in NEGOTIATION phase
-  4. Return structured result on COMPLETED / REJECTED / EXPIRED
+  2. POST to ACP API to create job (isAutomated=True for auto-pay)
+  3. Poll job status through phases:
+     REQUEST → NEGOTIATION → TRANSACTION → EVALUATION → COMPLETED/REJECTED/EXPIRED
+  4. Return structured result on terminal state
 
 API:
   - ACP API: https://claw-api.virtuals.io
@@ -231,11 +232,15 @@ class DGClawExecutor:
         """
         Create an ACP job targeting the Degen Claw Trader.
         POST /acp/jobs
+
+        ACP v1.0: uses providerWalletAddress, jobOfferingName,
+        serviceRequirements, isAutomated.
         """
         payload = {
             "providerWalletAddress": DGCLAW_TRADER_WALLET,
             "jobOfferingName": operation,
             "serviceRequirements": requirements,
+            "isAutomated": True,  # ACP v1.0: auto-approve payment flow
         }
         logger.debug(f"ACP create job: {operation} → {json.dumps(requirements)}")
         result = await self._acp_post(
@@ -259,17 +264,23 @@ class DGClawExecutor:
         return result
 
     async def _approve_payment(self, job_id) -> dict:
-        """POST /acp/providers/jobs/{jobId}/negotiation"""
+        """POST /acp/providers/jobs/{jobId}/negotiation — ACP v1.0 format."""
         return await self._acp_post(
             f"/acp/providers/jobs/{job_id}/negotiation",
-            {"accept": True},
+            {"accept": True, "content": "auto-approved by HyperTrader"},
             timeout=30,
         )
 
     async def _poll_job(self, job_id) -> dict:
         """
         Poll an ACP job until terminal state.
-        Auto-approves payment in NEGOTIATION phase.
+        Auto-approves payment in NEGOTIATION phase (fallback if isAutomated
+        didn't handle it).
+
+        ACP v1.0 phases:
+          REQUEST → NEGOTIATION → TRANSACTION → EVALUATION → COMPLETED
+                                                           → REJECTED
+                                                           → EXPIRED
         """
         for attempt in range(self.cfg.max_poll_attempts):
             await asyncio.sleep(self.cfg.poll_interval)
@@ -303,14 +314,10 @@ class DGClawExecutor:
                 }
 
             elif phase == "NEGOTIATION":
-                # Auto-approve payment (typically $0.01 ACP fee)
+                # With isAutomated=True this shouldn't trigger, but handle
+                # as fallback — auto-approve if within fee limit.
                 payment = status.get("paymentRequestData", {})
-                amount = 0
-                if isinstance(payment, dict):
-                    amount = payment.get("amountUsd", 0)
-                    if not amount:
-                        budget = payment.get("budget", {})
-                        amount = budget.get("amount", 0) if isinstance(budget, dict) else 0
+                amount = self._extract_payment_amount(payment)
 
                 if amount > self.cfg.max_auto_pay_usd:
                     logger.error(
@@ -328,7 +335,7 @@ class DGClawExecutor:
                 if "error" in pay_result:
                     logger.error(f"Payment failed: {pay_result['error']}")
 
-            # TRANSACTION, EVALUATION, REQUEST — keep polling
+            # REQUEST, TRANSACTION, EVALUATION — keep polling
 
         return {
             "status": "timeout",
@@ -337,16 +344,36 @@ class DGClawExecutor:
         }
 
     @staticmethod
+    def _extract_payment_amount(payment: dict) -> float:
+        """Extract USD payment amount from ACP v1.0 paymentRequestData."""
+        if not isinstance(payment, dict):
+            return 0
+        # Try direct usdValue or amountUsd
+        amount = payment.get("amountUsd") or payment.get("usdValue") or 0
+        if amount:
+            return float(amount)
+        # Try nested budget object (ACP v1.0 structure)
+        budget = payment.get("budget", {})
+        if isinstance(budget, dict):
+            amount = budget.get("usdValue") or budget.get("amount") or 0
+            return float(amount)
+        return 0
+
+    @staticmethod
     def _get_phase(status: dict) -> str:
-        """Extract the current phase, preferring memos over top-level."""
-        memos = status.get("memos", status.get("memoHistory", []))
+        """Extract current phase from ACP v1.0 job status.
+        Checks memoHistory last entry first, falls back to top-level phase."""
+        # ACP v1.0: memoHistory contains phase transitions
+        memos = status.get("memoHistory", status.get("memos", []))
         if memos and isinstance(memos, list):
             last = memos[-1]
             if isinstance(last, dict):
-                next_phase = last.get("nextPhase", "")
+                next_phase = last.get("nextPhase") or last.get("status", "")
                 if next_phase:
-                    return next_phase
-        return status.get("phase", "UNKNOWN")
+                    return next_phase.upper()
+        # Fallback to top-level phase
+        phase = status.get("phase", status.get("status", "UNKNOWN"))
+        return phase.upper() if isinstance(phase, str) else "UNKNOWN"
 
     @staticmethod
     def _get_rejection_reason(status: dict) -> str:
