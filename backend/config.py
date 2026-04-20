@@ -99,22 +99,30 @@ class OpenClawConfig(BaseModel):
 
 class DGClawConfig(BaseModel):
     enabled: bool = Field(True, description="Use DGClaw direct executor instead of OpenClaw")
+    # Hyperliquid direct trading (v4.0 — trades go directly to HL, not via ACP)
+    hl_api_wallet_key: Optional[str] = Field(
+        default_factory=lambda: os.getenv("HL_API_WALLET_KEY"),
+        description="Hyperliquid API wallet private key (from add-api-wallet.ts)"
+    )
+    hl_master_address: Optional[str] = Field(
+        default_factory=lambda: os.getenv("HL_MASTER_ADDRESS"),
+        description="Master wallet address (ACP agent wallet)"
+    )
+    # DGClaw platform (leaderboard/forum)
     api_key: Optional[str] = Field(
         default_factory=lambda: os.getenv("DGCLAW_API_KEY"),
         description="DGClaw API key for leaderboard/forum"
     )
+    # ACP (used only for deposits, not for trading)
     acp_api_key: Optional[str] = Field(
         default_factory=lambda: os.getenv("LITE_AGENT_API_KEY"),
-        description="ACP API key from `acp setup` (LITE_AGENT_API_KEY)"
+        description="ACP API key — used for USDC deposits only"
     )
     acp_builder_code: Optional[str] = Field(
         default_factory=lambda: os.getenv("ACP_BUILDER_CODE"),
         description="ACP builder code (optional)"
     )
-    poll_interval: float = Field(3.0, description="Seconds between ACP job status polls")
-    max_poll_attempts: int = Field(60, description="Max polls before timeout (60×3s = 3min)")
-    job_create_timeout: float = Field(30.0, description="Timeout for ACP job create request")
-    max_auto_pay_usd: float = Field(0.05, description="Max ACP fee to auto-approve ($)")
+    slippage_pct: float = Field(0.01, description="Market order slippage buffer (1%)")
     confirm_before_execute: bool = Field(False, description="Require confirmation (disabled for HFT)")
 
 class SystemConfig(BaseModel):

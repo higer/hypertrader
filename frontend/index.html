@@ -1006,15 +1006,14 @@ function renderConfig() {
       {k:'poll_interval', label:'Poll Interval (s)', type:'number', step:0.5},
       {k:'max_poll_attempts', label:'Max Poll Attempts', type:'number', step:1},
     ]},
-    { key:'dgclaw', title:'DGClaw Direct Executor', icon:'⚡', fields: [
-      {k:'enabled', label:'Enable DGClaw (bypass OpenClaw AI)', type:'toggle'},
-      {k:'acp_api_key', label:'ACP API Key (LITE_AGENT_API_KEY)', type:'password'},
-      {k:'acp_builder_code', label:'ACP Builder Code', type:'password'},
+    { key:'dgclaw', title:'DGClaw v4.0 — Direct Hyperliquid', icon:'⚡', fields: [
+      {k:'enabled', label:'Enable DGClaw (direct HL trading)', type:'toggle'},
+      {k:'hl_api_wallet_key', label:'HL API Wallet Key', type:'password'},
+      {k:'hl_master_address', label:'HL Master Address', type:'text'},
       {k:'api_key', label:'DGClaw Leaderboard API Key', type:'password'},
-      {k:'poll_interval', label:'ACP Job Poll Interval (s)', type:'number', step:0.5},
-      {k:'max_poll_attempts', label:'Max Poll Attempts', type:'number', step:1},
-      {k:'job_create_timeout', label:'Job Create Timeout (s)', type:'number', step:1},
-      {k:'max_auto_pay_usd', label:'Max Auto-Pay Fee ($)', type:'number', step:0.01},
+      {k:'acp_api_key', label:'ACP API Key (deposits only)', type:'password'},
+      {k:'acp_builder_code', label:'ACP Builder Code', type:'password'},
+      {k:'slippage_pct', label:'Slippage Buffer %', type:'number', step:0.001},
     ]},
   ];
 
@@ -1108,6 +1107,7 @@ async function saveConfig() {
     min_consolidation_bars:'i', funding_threshold:'f', holding_hours:'i', max_position_pct:'f',
     timeout:'i', top_n:'i', data_lookback_bars:'i', poll_interval_sec:'i',
     poll_interval:'f', max_poll_attempts:'i', job_create_timeout:'i', max_auto_pay_usd:'f',
+    slippage_pct:'f',
   };
 
   const newCfg = {};

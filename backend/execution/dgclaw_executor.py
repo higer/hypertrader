@@ -1,31 +1,30 @@
 """
-Degenerate Claw (dgclaw) direct executor — bypasses OpenClaw AI processing
-and sends structured ACP job commands directly to the Degen Claw Trader agent
-via the ACP REST API (pure HTTP, no CLI subprocess dependency).
+Degenerate Claw (dgclaw) executor — v4.0 architecture.
 
-This eliminates AI thinking overhead, endpoint routing issues, and the
-`npx tsx` dependency, enabling high-frequency trading execution.
+Trades directly on Hyperliquid via API wallet (EIP-712 signed orders),
+bypassing the ACP job layer entirely. ACP is only used for USDC deposits.
 
-Flow (ACP v1.0):
-  1. Convert structured command → ACP perp_trade JSON payload
-  2. POST to ACP API to create job (isAutomated=True for auto-pay)
-  3. Poll job status through phases:
-     REQUEST → NEGOTIATION → TRANSACTION → EVALUATION → COMPLETED/REJECTED/EXPIRED
-  4. Return structured result on terminal state
+Flow:
+  1. Sign order with HL_API_WALLET_KEY (API wallet private key)
+  2. POST signed action to https://api.hyperliquid.xyz/exchange
+  3. Set TP/SL as trigger orders
+  4. Query positions/balance via /info endpoint
 
-API:
-  - ACP API: https://claw-api.virtuals.io
-  - Auth: x-api-key (LITE_AGENT_API_KEY from `acp setup`)
-  - Degen Claw Trader wallet: 0xd478a8B40372db16cA8045F28C6FE07228F3781A
-  - Trading resource API: https://dgclaw-trader.virtuals.io
-  - ACP service fee: ~$0.01 per job
+Requirements:
+  - HL_API_WALLET_KEY: API wallet private key (from add-api-wallet.ts)
+  - HL_MASTER_ADDRESS: Master wallet address (ACP agent wallet)
+
+References:
+  - dgclaw-skill v4.0: https://github.com/Virtual-Protocol/dgclaw-skill
+  - Hyperliquid API: https://hyperliquid.gitbook.io/hyperliquid-docs
 """
 
 import asyncio
 import json
+import math
 import os
 import time
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
 
 import aiohttp
 from loguru import logger
@@ -36,65 +35,38 @@ from config import DGClawConfig
 # Constants
 # ---------------------------------------------------------------------------
 
+HL_API_BASE = "https://api.hyperliquid.xyz"
+HL_INFO_URL = f"{HL_API_BASE}/info"
+HL_EXCHANGE_URL = f"{HL_API_BASE}/exchange"
+
 DGCLAW_TRADER_WALLET = "0xd478a8B40372db16cA8045F28C6FE07228F3781A"
-DGCLAW_RESOURCE_BASE = "https://dgclaw-trader.virtuals.io"
-ACP_API_BASE = "https://claw-api.virtuals.io"
+DGCLAW_FORUM_BASE = "https://degen.virtuals.io"
 
 
 # ---------------------------------------------------------------------------
-# Helper: load ACP API key from openclaw-acp config.json
+# Hyperliquid EIP-712 signing helpers
 # ---------------------------------------------------------------------------
 
-def _load_acp_api_key() -> Optional[str]:
-    """
-    Load LITE_AGENT_API_KEY from environment or openclaw-acp config.json.
-    The `acp setup` command stores the key in <openclaw-acp>/config.json.
-    """
-    # 1. Environment variable (highest priority)
-    key = os.getenv("LITE_AGENT_API_KEY", "").strip()
-    if key:
-        return key
-
-    # 2. Try common config.json locations
-    candidates = [
-        os.path.expanduser("~/openclaw-acp/config.json"),
-        os.path.expanduser("~/.openclaw/config.json"),
-        "/workspace/openclaw-acp/config.json",
-    ]
-    for path in candidates:
-        try:
-            with open(path) as f:
-                cfg = json.load(f)
-            key = cfg.get("LITE_AGENT_API_KEY", "").strip()
-            if key:
-                logger.info(f"ACP API key loaded from {path}")
-                return key
-        except (FileNotFoundError, json.JSONDecodeError, KeyError):
-            continue
-
-    return None
+def _load_wallet(cfg: DGClawConfig):
+    """Load API wallet from config or env."""
+    key = cfg.hl_api_wallet_key or os.getenv("HL_API_WALLET_KEY", "").strip()
+    if not key:
+        return None, None
+    try:
+        from eth_account import Account
+        if not key.startswith("0x"):
+            key = "0x" + key
+        account = Account.from_key(key)
+        return account, key
+    except Exception as e:
+        logger.error(f"Failed to load API wallet: {e}")
+        return None, None
 
 
-def _load_acp_builder_code() -> Optional[str]:
-    """Load ACP_BUILDER_CODE from environment or config."""
-    code = os.getenv("ACP_BUILDER_CODE", "").strip()
-    if code:
-        return code
-    candidates = [
-        os.path.expanduser("~/openclaw-acp/config.json"),
-        os.path.expanduser("~/.openclaw/config.json"),
-        "/workspace/openclaw-acp/config.json",
-    ]
-    for path in candidates:
-        try:
-            with open(path) as f:
-                cfg = json.load(f)
-            code = cfg.get("ACP_BUILDER_CODE", "").strip()
-            if code:
-                return code
-        except (FileNotFoundError, json.JSONDecodeError):
-            continue
-    return None
+def _get_master_address(cfg: DGClawConfig) -> Optional[str]:
+    """Get master wallet address."""
+    addr = cfg.hl_master_address or os.getenv("HL_MASTER_ADDRESS", "").strip()
+    return addr if addr else None
 
 
 # ---------------------------------------------------------------------------
@@ -102,330 +74,328 @@ def _load_acp_builder_code() -> Optional[str]:
 # ---------------------------------------------------------------------------
 
 class DGClawExecutor:
+    """
+    Direct Hyperliquid executor for dgclaw-skill v4.0.
+    Trades via API wallet signing, queries via info endpoint.
+    """
 
     def __init__(self, cfg: DGClawConfig):
         self.cfg = cfg
         self.order_log: List[dict] = []
-        self._acp_session: Optional[aiohttp.ClientSession] = None  # ACP API
-        self._res_session: Optional[aiohttp.ClientSession] = None  # resource API
+        self._session: Optional[aiohttp.ClientSession] = None
         self._connected: Optional[bool] = None
-        self._wallet: Optional[str] = None
-        self._acp_api_key: Optional[str] = None
-        self._acp_builder_code: Optional[str] = None
+        self._account = None
+        self._api_key = None
+        self._master_address: Optional[str] = None
+        self._asset_meta: Dict[str, dict] = {}  # coin → {index, szDecimals, maxLeverage}
+        self._meta_ts: float = 0  # last meta refresh time
 
-    async def _ensure_acp_session(self):
-        """Create/reuse the ACP API HTTP session with auth headers."""
-        if self._acp_session and not self._acp_session.closed:
+        # Load wallet
+        self._account, self._api_key = _load_wallet(cfg)
+        self._master_address = _get_master_address(cfg)
+
+        if self._account:
+            logger.info(f"DGClaw executor: API wallet {self._account.address}")
+        else:
+            logger.warning("DGClaw executor: HL_API_WALLET_KEY not set — trading disabled")
+        if self._master_address:
+            logger.info(f"DGClaw executor: master address {self._master_address}")
+        else:
+            logger.warning("DGClaw executor: HL_MASTER_ADDRESS not set — queries disabled")
+
+    async def _ensure_session(self):
+        if self._session and not self._session.closed:
             return
-
-        # Load API key
-        if not self._acp_api_key:
-            self._acp_api_key = (
-                self.cfg.acp_api_key
-                or _load_acp_api_key()
-            )
-        if not self._acp_builder_code:
-            self._acp_builder_code = (
-                self.cfg.acp_builder_code
-                or _load_acp_builder_code()
-            )
-
-        if not self._acp_api_key:
-            raise RuntimeError(
-                "ACP API key not found. Set LITE_AGENT_API_KEY env var "
-                "or run `acp setup` in openclaw-acp."
-            )
-
-        headers = {
-            "Content-Type": "application/json",
-            "x-api-key": self._acp_api_key,
-        }
-        if self._acp_builder_code:
-            headers["x-builder-code"] = self._acp_builder_code
-
-        base = os.getenv("ACP_API_URL", ACP_API_BASE).rstrip("/")
-        self._acp_session = aiohttp.ClientSession(
-            base_url=base,
-            headers=headers,
+        self._session = aiohttp.ClientSession(
+            headers={"Content-Type": "application/json"}
         )
-
-    async def _ensure_res_session(self):
-        """Create/reuse the resource query HTTP session."""
-        if self._res_session and not self._res_session.closed:
-            return
-        headers = {}
-        if self.cfg.api_key:
-            headers["Authorization"] = f"Bearer {self.cfg.api_key}"
-        self._res_session = aiohttp.ClientSession(headers=headers)
 
     async def close(self):
-        for s in (self._acp_session, self._res_session):
-            if s and not s.closed:
-                await s.close()
+        if self._session and not self._session.closed:
+            await self._session.close()
 
     # ------------------------------------------------------------------
-    # ACP REST helpers
+    # Hyperliquid Info API (queries — no signing needed)
     # ------------------------------------------------------------------
 
-    async def _acp_post(self, path: str, payload: dict,
-                        timeout: float = 30) -> dict:
-        """POST to ACP API and return parsed response."""
-        await self._ensure_acp_session()
+    async def _info_post(self, payload: dict) -> dict:
+        """POST to /info endpoint."""
+        await self._ensure_session()
         try:
-            async with self._acp_session.post(
-                path, json=payload,
-                timeout=aiohttp.ClientTimeout(total=timeout),
+            async with self._session.post(
+                HL_INFO_URL, json=payload,
+                timeout=aiohttp.ClientTimeout(total=15),
             ) as r:
                 body = await r.json()
                 if r.status >= 400:
-                    error_msg = json.dumps(body) if isinstance(body, dict) else str(body)
-                    logger.error(f"ACP POST {path} → {r.status}: {error_msg[:300]}")
-                    return {"error": f"HTTP {r.status}: {error_msg[:300]}"}
-                return body
-        except aiohttp.ClientError as e:
-            return {"error": f"ACP connection error: {e}"}
-        except asyncio.TimeoutError:
-            return {"error": f"ACP request to {path} timed out"}
+                    return {"error": f"HTTP {r.status}: {json.dumps(body)[:300]}"}
+                return body if isinstance(body, dict) else {"data": body}
         except Exception as e:
-            return {"error": f"ACP request error: {e}"}
+            return {"error": f"Info request failed: {e}"}
 
-    async def _acp_get(self, path: str, timeout: float = 15) -> dict:
-        """GET from ACP API."""
-        await self._ensure_acp_session()
-        try:
-            async with self._acp_session.get(
-                path, timeout=aiohttp.ClientTimeout(total=timeout),
-            ) as r:
-                body = await r.json()
-                if r.status >= 400:
-                    error_msg = json.dumps(body) if isinstance(body, dict) else str(body)
-                    return {"error": f"HTTP {r.status}: {error_msg[:300]}"}
-                return body
-        except aiohttp.ClientError as e:
-            return {"error": f"ACP connection error: {e}"}
-        except asyncio.TimeoutError:
-            return {"error": f"ACP GET {path} timed out"}
-        except Exception as e:
-            return {"error": f"ACP request error: {e}"}
+    async def _refresh_meta(self):
+        """Refresh asset metadata (cached for 5 min)."""
+        if time.time() - self._meta_ts < 300 and self._asset_meta:
+            return
+        result = await self._info_post({"type": "meta"})
+        if "error" in result:
+            logger.warning(f"Meta refresh failed: {result['error']}")
+            return
+        universe = result.get("universe", [])
+        if not universe and isinstance(result.get("data"), dict):
+            universe = result["data"].get("universe", [])
+        for i, asset in enumerate(universe):
+            name = asset.get("name", "").upper()
+            self._asset_meta[name] = {
+                "index": i,
+                "szDecimals": asset.get("szDecimals", 2),
+                "maxLeverage": asset.get("maxLeverage", 50),
+            }
+        self._meta_ts = time.time()
+        logger.debug(f"HL meta refreshed: {len(self._asset_meta)} assets")
 
-    # ------------------------------------------------------------------
-    # Identity
-    # ------------------------------------------------------------------
+    def _get_asset(self, coin: str) -> Optional[dict]:
+        return self._asset_meta.get(coin.upper())
 
-    async def _get_wallet(self) -> Optional[str]:
-        """Get our wallet address via GET /acp/me (cached)."""
-        if self._wallet:
-            return self._wallet
-        result = await self._acp_get("/acp/me")
-        if "error" not in result:
-            data = result.get("data", result)
-            self._wallet = data.get("walletAddress") or data.get("address")
-            if self._wallet:
-                logger.info(f"ACP wallet: {self._wallet}")
-        return self._wallet
+    async def _get_all_mids(self) -> Dict[str, float]:
+        """Get mid prices for all assets."""
+        result = await self._info_post({"type": "allMids"})
+        if "error" in result:
+            return {}
+        # Response is {coin: midPrice, ...}
+        mids = {}
+        data = result.get("data", result)
+        if isinstance(data, dict):
+            for k, v in data.items():
+                try:
+                    mids[k.upper()] = float(v)
+                except (ValueError, TypeError):
+                    pass
+        return mids
 
-    # ------------------------------------------------------------------
-    # ACP job lifecycle (pure HTTP)
-    # ------------------------------------------------------------------
-
-    async def _create_job(self, operation: str, requirements: dict) -> dict:
-        """
-        Create an ACP job targeting the Degen Claw Trader.
-        POST /acp/jobs
-
-        ACP v1.0: uses providerWalletAddress, jobOfferingName,
-        serviceRequirements, isAutomated.
-        """
-        payload = {
-            "providerWalletAddress": DGCLAW_TRADER_WALLET,
-            "jobOfferingName": operation,
-            "serviceRequirements": requirements,
-            "isAutomated": True,  # ACP v1.0: auto-approve payment flow
-        }
-        logger.debug(f"ACP create job: {operation} → {json.dumps(requirements)}")
-        result = await self._acp_post(
-            "/acp/jobs", payload, timeout=self.cfg.job_create_timeout
-        )
-
-        # Extract jobId from response: { data: { jobId: N } }
-        if "error" not in result:
-            data = result.get("data", result)
-            job_id = data.get("jobId") or data.get("id")
-            if job_id:
-                return {"jobId": job_id}
-            return {"error": "No jobId in response", "raw": result}
-        return result
-
-    async def _get_job_status(self, job_id) -> dict:
-        """GET /acp/jobs/{jobId}"""
-        result = await self._acp_get(f"/acp/jobs/{job_id}")
-        if "error" not in result:
-            return result.get("data", result)
-        return result
-
-    async def _approve_payment(self, job_id) -> dict:
-        """POST /acp/providers/jobs/{jobId}/negotiation — ACP v1.0 format."""
-        return await self._acp_post(
-            f"/acp/providers/jobs/{job_id}/negotiation",
-            {"accept": True, "content": "auto-approved by HyperTrader"},
-            timeout=30,
-        )
-
-    async def _poll_job(self, job_id) -> dict:
-        """
-        Poll an ACP job until terminal state.
-        Auto-approves payment in NEGOTIATION phase (fallback if isAutomated
-        didn't handle it).
-
-        ACP v1.0 phases:
-          REQUEST → NEGOTIATION → TRANSACTION → EVALUATION → COMPLETED
-                                                           → REJECTED
-                                                           → EXPIRED
-        """
-        for attempt in range(self.cfg.max_poll_attempts):
-            await asyncio.sleep(self.cfg.poll_interval)
-
-            status = await self._get_job_status(job_id)
-            if "error" in status:
-                logger.warning(f"Poll error (attempt {attempt+1}): {status['error']}")
+    async def get_positions(self) -> dict:
+        """Query open positions from Hyperliquid."""
+        if not self._master_address:
+            return {"error": "HL_MASTER_ADDRESS not set"}
+        result = await self._info_post({
+            "type": "clearinghouseState",
+            "user": self._master_address,
+        })
+        if "error" in result:
+            return result
+        positions = []
+        for p in result.get("assetPositions", []):
+            pos = p.get("position", {})
+            szi = float(pos.get("szi", 0))
+            if szi == 0:
                 continue
+            positions.append({
+                "coin": pos.get("coin", ""),
+                "side": "long" if szi > 0 else "short",
+                "size": abs(szi),
+                "entryPrice": pos.get("entryPx", "0"),
+                "markPrice": pos.get("positionValue", "0"),
+                "unrealizedPnl": pos.get("unrealizedPnl", "0"),
+                "leverage": pos.get("leverage", {}).get("value", 1),
+                "liquidationPrice": pos.get("liquidationPx"),
+            })
+        return {"positions": positions}
 
-            phase = self._get_phase(status)
-            logger.debug(f"Job {job_id} phase: {phase} (attempt {attempt+1})")
+    async def get_account(self) -> dict:
+        """Query account balance."""
+        if not self._master_address:
+            return {"error": "HL_MASTER_ADDRESS not set"}
+        # Get both spot and perp state
+        perp = await self._info_post({
+            "type": "clearinghouseState",
+            "user": self._master_address,
+        })
+        spot = await self._info_post({
+            "type": "spotClearinghouseState",
+            "user": self._master_address,
+        })
+        result = {}
+        if "error" not in perp:
+            ms = perp.get("marginSummary", {})
+            result["perp"] = {
+                "accountValue": ms.get("accountValue", "0"),
+                "totalMarginUsed": ms.get("totalMarginUsed", "0"),
+                "withdrawable": perp.get("withdrawable", "0"),
+            }
+        if "error" not in spot:
+            result["spot"] = {
+                "balances": spot.get("balances", []),
+            }
+        return result if result else {"error": "Failed to query account"}
 
-            if phase == "COMPLETED":
-                deliverable = status.get("deliverable", "")
-                logger.info(f"Job {job_id} COMPLETED: {str(deliverable)[:200]}")
-                return {
-                    "status": "completed",
-                    "job_id": job_id,
-                    "deliverable": deliverable,
-                    "raw": status,
-                }
+    async def get_trade_history(self, pair: str = None, limit: int = 50) -> dict:
+        """Query trade fills from Hyperliquid."""
+        if not self._master_address:
+            return {"error": "HL_MASTER_ADDRESS not set"}
+        result = await self._info_post({
+            "type": "userFills",
+            "user": self._master_address,
+        })
+        if "error" in result:
+            return result
+        fills = result if isinstance(result, list) else result.get("data", [])
+        if pair:
+            fills = [f for f in fills if f.get("coin", "").upper() == pair.upper()]
+        return {"trades": fills[:limit]}
 
-            elif phase in ("REJECTED", "EXPIRED"):
-                reason = self._get_rejection_reason(status)
-                logger.error(f"Job {job_id} {phase}: {reason}")
-                return {
-                    "status": phase.lower(),
-                    "job_id": job_id,
-                    "error": f"Job {phase}: {reason}",
-                    "raw": status,
-                }
-
-            elif phase == "NEGOTIATION":
-                # With isAutomated=True this shouldn't trigger, but handle
-                # as fallback — auto-approve if within fee limit.
-                payment = status.get("paymentRequestData", {})
-                amount = self._extract_payment_amount(payment)
-
-                if amount > self.cfg.max_auto_pay_usd:
-                    logger.error(
-                        f"Job {job_id} payment ${amount} exceeds "
-                        f"max_auto_pay ${self.cfg.max_auto_pay_usd}"
-                    )
-                    return {
-                        "status": "rejected",
-                        "job_id": job_id,
-                        "error": f"Payment ${amount} exceeds limit",
-                    }
-
-                logger.info(f"Job {job_id} auto-paying ${amount}")
-                pay_result = await self._approve_payment(job_id)
-                if "error" in pay_result:
-                    logger.error(f"Payment failed: {pay_result['error']}")
-
-            # REQUEST, TRANSACTION, EVALUATION — keep polling
-
-        return {
-            "status": "timeout",
-            "job_id": job_id,
-            "error": f"Job {job_id} timed out after {self.cfg.max_poll_attempts} polls",
-        }
-
-    @staticmethod
-    def _extract_payment_amount(payment: dict) -> float:
-        """Extract USD payment amount from ACP v1.0 paymentRequestData."""
-        if not isinstance(payment, dict):
-            return 0
-        # Try direct usdValue or amountUsd
-        amount = payment.get("amountUsd") or payment.get("usdValue") or 0
-        if amount:
-            return float(amount)
-        # Try nested budget object (ACP v1.0 structure)
-        budget = payment.get("budget", {})
-        if isinstance(budget, dict):
-            amount = budget.get("usdValue") or budget.get("amount") or 0
-            return float(amount)
-        return 0
-
-    @staticmethod
-    def _get_phase(status: dict) -> str:
-        """Extract current phase from ACP v1.0 job status.
-        Checks memoHistory last entry first, falls back to top-level phase."""
-        # ACP v1.0: memoHistory contains phase transitions
-        memos = status.get("memoHistory", status.get("memos", []))
-        if memos and isinstance(memos, list):
-            last = memos[-1]
-            if isinstance(last, dict):
-                next_phase = last.get("nextPhase") or last.get("status", "")
-                if next_phase:
-                    return next_phase.upper()
-        # Fallback to top-level phase
-        phase = status.get("phase", status.get("status", "UNKNOWN"))
-        return phase.upper() if isinstance(phase, str) else "UNKNOWN"
-
-    @staticmethod
-    def _get_rejection_reason(status: dict) -> str:
-        memos = status.get("memos", status.get("memoHistory", []))
-        if memos and isinstance(memos, list):
-            for entry in reversed(memos):
-                content = entry.get("content", "")
-                if content:
-                    return str(content)[:300]
-        return status.get("deliverable", "unknown reason")
+    async def get_tickers(self) -> dict:
+        """Get all available trading pairs with mid prices."""
+        await self._refresh_meta()
+        mids = await self._get_all_mids()
+        tickers = []
+        for coin, meta in self._asset_meta.items():
+            tickers.append({
+                "symbol": coin,
+                "midPrice": mids.get(coin, 0),
+                "maxLeverage": meta["maxLeverage"],
+                "szDecimals": meta["szDecimals"],
+            })
+        return {"tickers": tickers}
 
     # ------------------------------------------------------------------
-    # Build trade payloads
+    # Hyperliquid Exchange API (signed actions)
+    # ------------------------------------------------------------------
+
+    async def _exchange_post(self, action: dict, nonce: int = None,
+                             vault_address: str = None) -> dict:
+        """
+        Sign and POST an action to /exchange.
+        Uses the Hyperliquid Python SDK for proper EIP-712 signing.
+        """
+        if not self._account:
+            return {"error": "HL_API_WALLET_KEY not set — cannot trade"}
+
+        await self._ensure_session()
+
+        if nonce is None:
+            nonce = int(time.time() * 1000)
+
+        try:
+            from hyperliquid.utils.signing import (
+                sign_l1_action,
+                float_to_wire,
+                order_type_to_wire,
+            )
+            # Use the SDK's signing
+            signature = sign_l1_action(
+                self._account, action, vault_address, nonce, True
+            )
+            payload = {
+                "action": action,
+                "nonce": nonce,
+                "signature": signature,
+            }
+            if vault_address:
+                payload["vaultAddress"] = vault_address
+
+            async with self._session.post(
+                HL_EXCHANGE_URL, json=payload,
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as r:
+                body = await r.json()
+                if r.status >= 400:
+                    return {"error": f"HTTP {r.status}: {json.dumps(body)[:300]}"}
+                return body
+        except ImportError:
+            return await self._exchange_post_raw(action, nonce, vault_address)
+        except Exception as e:
+            logger.error(f"Exchange POST failed: {e}")
+            return {"error": f"Exchange request failed: {e}"}
+
+    async def _exchange_post_raw(self, action: dict, nonce: int,
+                                 vault_address: str = None) -> dict:
+        """
+        Fallback: Sign and POST using raw eth_account EIP-712.
+        Used when hyperliquid-python-sdk is not installed.
+        """
+        try:
+            from eth_account.messages import encode_structured_data
+
+            # Hyperliquid uses a specific EIP-712 domain
+            domain = {
+                "name": "Exchange",
+                "version": "1",
+                "chainId": 1337,
+                "verifyingContract": "0x0000000000000000000000000000000000000000",
+            }
+
+            # Build the typed data for the action
+            # The exact structure depends on the action type
+            action_str = json.dumps(action, separators=(",", ":"), sort_keys=True)
+            connection_id = action_str  # simplified hash
+
+            typed_data = {
+                "types": {
+                    "EIP712Domain": [
+                        {"name": "name", "type": "string"},
+                        {"name": "version", "type": "string"},
+                        {"name": "chainId", "type": "uint256"},
+                        {"name": "verifyingContract", "type": "address"},
+                    ],
+                    "HyperliquidTransaction:Approve": [
+                        {"name": "hyperliquidChain", "type": "string"},
+                        {"name": "signatureChainId", "type": "uint64"},
+                        {"name": "nonce", "type": "uint64"},
+                    ],
+                },
+                "primaryType": "HyperliquidTransaction:Approve",
+                "domain": domain,
+                "message": {
+                    "hyperliquidChain": "Mainnet",
+                    "signatureChainId": "0x66eee",
+                    "nonce": nonce,
+                },
+            }
+
+            signed = self._account.sign_message(
+                encode_structured_data(typed_data)
+            )
+
+            payload = {
+                "action": action,
+                "nonce": nonce,
+                "signature": {
+                    "r": hex(signed.r),
+                    "s": hex(signed.s),
+                    "v": signed.v,
+                },
+            }
+
+            async with self._session.post(
+                HL_EXCHANGE_URL, json=payload,
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as r:
+                body = await r.json()
+                if r.status >= 400:
+                    return {"error": f"HTTP {r.status}: {json.dumps(body)[:300]}"}
+                return body
+        except Exception as e:
+            logger.error(f"Raw exchange POST failed: {e}")
+            return {"error": f"Signing/exchange failed: {e}"}
+
+    # ------------------------------------------------------------------
+    # Trading helpers
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _build_open_payload(cmd: dict) -> dict:
-        """Convert our internal command format → dgclaw perp_trade JSON."""
-        payload = {
-            "action": "open",
-            "pair": cmd["coin"],
-            "side": cmd["direction"],          # "long" or "short"
-            "size": str(int(cmd["size_usd"])),  # string, USD notional
-            "orderType": cmd.get("order_type", "market"),
-        }
-        if cmd.get("leverage"):
-            payload["leverage"] = int(cmd["leverage"])  # number, not string
-        if cmd.get("stop_loss"):
-            payload["stopLoss"] = str(cmd["stop_loss"])
-        if cmd.get("take_profit"):
-            payload["takeProfit"] = str(cmd["take_profit"])
-        if cmd.get("limit_price") and payload["orderType"] == "limit":
-            payload["limitPrice"] = str(cmd["limit_price"])
-        return payload
+    def _format_price(price: float, sig_figs: int = 5) -> str:
+        """Format price to significant figures."""
+        if price == 0:
+            return "0"
+        return f"{price:.{sig_figs}g}"
 
     @staticmethod
-    def _build_close_payload(cmd: dict) -> dict:
-        return {
-            "action": "close",
-            "pair": cmd["coin"],
-        }
-
-    @staticmethod
-    def _build_modify_payload(cmd: dict) -> dict:
-        payload = {"pair": cmd["coin"]}
-        if cmd.get("leverage"):
-            payload["leverage"] = int(cmd["leverage"])
-        if cmd.get("stop_loss"):
-            payload["stopLoss"] = str(cmd["stop_loss"])
-        if cmd.get("take_profit"):
-            payload["takeProfit"] = str(cmd["take_profit"])
-        return payload
+    def _format_size(usd_size: float, price: float, sz_decimals: int) -> str:
+        """Convert USD notional to asset size."""
+        if price <= 0:
+            return "0"
+        raw = usd_size / price
+        return f"{raw:.{sz_decimals}f}"
 
     # ------------------------------------------------------------------
     # High-level trading commands
@@ -435,13 +405,15 @@ class DGClawExecutor:
                           leverage: int, entry_price: float,
                           stop_loss: float, take_profit: float,
                           strategy: str = "") -> dict:
-        """Open a position via ACP perp_trade job."""
-        cmd = {
-            "coin": coin, "direction": direction,
-            "size_usd": size_usd, "leverage": leverage,
-            "stop_loss": stop_loss, "take_profit": take_profit,
-        }
-        payload = self._build_open_payload(cmd)
+        """Open a position on Hyperliquid via direct API."""
+        await self._refresh_meta()
+        asset = self._get_asset(coin)
+        if not asset:
+            return {"error": f"Unknown asset: {coin}. Run tickers to see available pairs."}
+
+        asset_id = asset["index"]
+        sz_decimals = asset["szDecimals"]
+        is_buy = direction == "long"
 
         logger.info(
             f"→ DGCLAW OPEN {direction.upper()} {coin} "
@@ -449,188 +421,353 @@ class DGClawExecutor:
         )
 
         record = {
-            "ts": time.time(),
-            "action": "open",
-            "coin": coin,
-            "direction": direction,
-            "payload": payload,
+            "ts": time.time(), "action": "open",
+            "coin": coin, "direction": direction,
         }
 
-        result = await self._create_job("perp_trade", payload)
+        # 1. Set leverage
+        lev_result = await self._exchange_post({
+            "type": "updateLeverage",
+            "asset": asset_id,
+            "isCross": True,
+            "leverage": leverage,
+        })
+        if "error" in lev_result:
+            logger.warning(f"Leverage set warning: {lev_result['error']}")
+            # Continue anyway — leverage might already be set
 
-        if "error" in result:
-            record["error"] = result["error"]
+        # 2. Get mid price for market order
+        mids = await self._get_all_mids()
+        mid_price = mids.get(coin.upper(), entry_price)
+        if mid_price <= 0:
+            record["error"] = f"No mid price for {coin}"
             self._append_log(record)
-            return result
+            return {"error": f"Could not get mid price for {coin}"}
 
-        job_id = result.get("jobId")
-        if not job_id:
-            record["error"] = "No job ID returned"
+        # Market order with slippage
+        slippage = self.cfg.slippage_pct
+        order_price = mid_price * (1 + slippage) if is_buy else mid_price * (1 - slippage)
+        order_price_str = self._format_price(order_price)
+        sz = self._format_size(size_usd, mid_price, sz_decimals)
+
+        logger.info(f"  size={sz} price={order_price_str} mid={mid_price}")
+
+        # 3. Place main order
+        order_result = await self._exchange_post({
+            "type": "order",
+            "orders": [{
+                "a": asset_id,
+                "b": is_buy,
+                "p": order_price_str,
+                "s": sz,
+                "r": False,
+                "t": {"limit": {"tif": "Ioc"}},
+            }],
+            "grouping": "na",
+        })
+
+        record["order_result"] = order_result
+        if "error" in order_result:
+            record["error"] = order_result["error"]
             self._append_log(record)
-            return {"error": "No job ID in ACP response", "raw": result}
+            return order_result
 
-        record["job_id"] = job_id
-        logger.info(f"ACP job created: {job_id}")
+        # Check if order was filled
+        status = order_result.get("status", order_result.get("response", {}).get("type", ""))
+        statuses = order_result.get("response", {}).get("data", {}).get("statuses", [])
+        if statuses:
+            first_status = statuses[0] if statuses else {}
+            if isinstance(first_status, dict) and "error" in first_status:
+                record["error"] = first_status["error"]
+                self._append_log(record)
+                return {"error": first_status["error"]}
 
-        poll_result = await self._poll_job(job_id)
-        record["result"] = poll_result
+        logger.info(f"Order placed: {json.dumps(order_result)[:200]}")
+
+        # 4. Set TP trigger order
+        if take_profit and take_profit > 0:
+            tp_result = await self._exchange_post({
+                "type": "order",
+                "orders": [{
+                    "a": asset_id,
+                    "b": not is_buy,
+                    "p": self._format_price(take_profit),
+                    "s": sz,
+                    "r": True,
+                    "t": {"trigger": {
+                        "triggerPx": self._format_price(take_profit),
+                        "isMarket": True,
+                        "tpsl": "tp",
+                    }},
+                }],
+                "grouping": "na",
+            })
+            if "error" not in tp_result:
+                logger.info(f"TP set at {take_profit}")
+            else:
+                logger.warning(f"TP set failed: {tp_result['error']}")
+
+        # 5. Set SL trigger order
+        if stop_loss and stop_loss > 0:
+            sl_result = await self._exchange_post({
+                "type": "order",
+                "orders": [{
+                    "a": asset_id,
+                    "b": not is_buy,
+                    "p": self._format_price(stop_loss),
+                    "s": sz,
+                    "r": True,
+                    "t": {"trigger": {
+                        "triggerPx": self._format_price(stop_loss),
+                        "isMarket": True,
+                        "tpsl": "sl",
+                    }},
+                }],
+                "grouping": "na",
+            })
+            if "error" not in sl_result:
+                logger.info(f"SL set at {stop_loss}")
+            else:
+                logger.warning(f"SL set failed: {sl_result['error']}")
+
+        result = {"status": "completed", "order": order_result}
+        record["result"] = result
         self._append_log(record)
-        return poll_result
+        return result
 
     async def close_position(self, coin: str, direction: str,
                              reason: str = "") -> dict:
-        """Close a position via ACP perp_trade job."""
-        payload = self._build_close_payload({"coin": coin})
+        """Close a position on Hyperliquid."""
+        await self._refresh_meta()
+        asset = self._get_asset(coin)
+        if not asset:
+            return {"error": f"Unknown asset: {coin}"}
+
+        asset_id = asset["index"]
 
         logger.info(f"→ DGCLAW CLOSE {direction.upper()} {coin} reason={reason}")
 
         record = {
-            "ts": time.time(),
-            "action": "close",
-            "coin": coin,
-            "direction": direction,
-            "reason": reason,
-            "payload": payload,
+            "ts": time.time(), "action": "close",
+            "coin": coin, "direction": direction, "reason": reason,
         }
 
-        result = await self._create_job("perp_trade", payload)
-
-        if "error" in result:
-            record["error"] = result["error"]
+        # Get current position size
+        if not self._master_address:
+            record["error"] = "HL_MASTER_ADDRESS not set"
             self._append_log(record)
-            return result
+            return {"error": "HL_MASTER_ADDRESS not set"}
 
-        job_id = result.get("jobId")
-        if not job_id:
-            record["error"] = "No job ID returned"
+        state = await self._info_post({
+            "type": "clearinghouseState",
+            "user": self._master_address,
+        })
+        if "error" in state:
+            record["error"] = state["error"]
             self._append_log(record)
-            return {"error": "No job ID in ACP response", "raw": result}
+            return state
 
-        record["job_id"] = job_id
-        poll_result = await self._poll_job(job_id)
-        record["result"] = poll_result
+        # Find the position
+        pos_data = None
+        for p in state.get("assetPositions", []):
+            pos = p.get("position", {})
+            if pos.get("coin", "").upper() == coin.upper():
+                szi = float(pos.get("szi", 0))
+                if szi != 0:
+                    pos_data = {"szi": szi, "coin": pos["coin"]}
+                    break
+
+        if not pos_data:
+            record["error"] = f"No open position for {coin}"
+            self._append_log(record)
+            return {"error": f"No open position for {coin}"}
+
+        szi = pos_data["szi"]
+        is_buy = szi < 0  # Close short = buy, close long = sell
+        sz = str(abs(szi))
+
+        # Market close with slippage
+        mids = await self._get_all_mids()
+        mid_price = mids.get(coin.upper(), 0)
+        if mid_price <= 0:
+            record["error"] = f"No mid price for {coin}"
+            self._append_log(record)
+            return {"error": f"Could not get mid price for {coin}"}
+
+        slippage = self.cfg.slippage_pct
+        order_price = mid_price * (1 + slippage) if is_buy else mid_price * (1 - slippage)
+        order_price_str = self._format_price(order_price)
+
+        logger.info(f"  closing size={sz} price={order_price_str}")
+
+        order_result = await self._exchange_post({
+            "type": "order",
+            "orders": [{
+                "a": asset_id,
+                "b": is_buy,
+                "p": order_price_str,
+                "s": sz,
+                "r": True,  # reduce-only
+                "t": {"limit": {"tif": "Ioc"}},
+            }],
+            "grouping": "na",
+        })
+
+        record["order_result"] = order_result
+        if "error" in order_result:
+            record["error"] = order_result["error"]
+            self._append_log(record)
+            return order_result
+
+        result = {"status": "completed", "order": order_result}
+        record["result"] = result
         self._append_log(record)
-        return poll_result
+        return result
 
     async def modify_position(self, coin: str, leverage: int = None,
                               stop_loss: float = None,
                               take_profit: float = None) -> dict:
-        """Modify an open position's SL/TP/leverage via ACP perp_modify."""
-        cmd = {"coin": coin}
+        """Modify an open position's SL/TP/leverage."""
+        await self._refresh_meta()
+        asset = self._get_asset(coin)
+        if not asset:
+            return {"error": f"Unknown asset: {coin}"}
+
+        asset_id = asset["index"]
+        results = {}
+
+        # Update leverage
         if leverage is not None:
-            cmd["leverage"] = leverage
-        if stop_loss is not None:
-            cmd["stop_loss"] = stop_loss
-        if take_profit is not None:
-            cmd["take_profit"] = take_profit
+            lev_result = await self._exchange_post({
+                "type": "updateLeverage",
+                "asset": asset_id,
+                "isCross": True,
+                "leverage": leverage,
+            })
+            results["leverage"] = lev_result
+            logger.info(f"Leverage updated to {leverage}x")
 
-        payload = self._build_modify_payload(cmd)
-        logger.info(f"→ DGCLAW MODIFY {coin} {payload}")
+        # Get position to know direction and size
+        if stop_loss or take_profit:
+            if not self._master_address:
+                return {"error": "HL_MASTER_ADDRESS not set"}
 
-        result = await self._create_job("perp_modify", payload)
-        if "error" in result:
-            return result
+            state = await self._info_post({
+                "type": "clearinghouseState",
+                "user": self._master_address,
+            })
+            if "error" in state:
+                return state
 
-        job_id = result.get("jobId")
-        if not job_id:
-            return {"error": "No job ID in ACP response", "raw": result}
+            pos_data = None
+            for p in state.get("assetPositions", []):
+                pos = p.get("position", {})
+                if pos.get("coin", "").upper() == coin.upper():
+                    szi = float(pos.get("szi", 0))
+                    if szi != 0:
+                        pos_data = {"szi": szi}
+                        break
 
-        return await self._poll_job(job_id)
+            if not pos_data:
+                return {"error": f"No open position for {coin}"}
 
-    # ------------------------------------------------------------------
-    # Resource queries (direct HTTP — fast, no ACP overhead)
-    # ------------------------------------------------------------------
+            is_long = pos_data["szi"] > 0
+            sz = str(abs(pos_data["szi"]))
 
-    async def get_positions(self) -> dict:
-        """Query live open positions from dgclaw-trader API."""
-        wallet = await self._get_wallet()
-        if not wallet:
-            return {"error": "Wallet address unknown — set LITE_AGENT_API_KEY"}
-        return await self._resource_get(f"/users/{wallet}/positions")
+            # Cancel existing TP/SL orders
+            open_orders = await self._info_post({
+                "type": "openOrders",
+                "user": self._master_address,
+            })
+            if "error" not in open_orders:
+                orders_data = open_orders if isinstance(open_orders, list) else open_orders.get("data", [])
+                for o in orders_data:
+                    if (o.get("coin", "").upper() == coin.upper()
+                            and "trigger" in str(o.get("orderType", "")).lower()):
+                        try:
+                            await self._exchange_post({
+                                "type": "cancel",
+                                "cancels": [{"a": asset_id, "o": o["oid"]}],
+                            })
+                        except Exception:
+                            pass
 
-    async def get_account(self) -> dict:
-        """Query account balance."""
-        wallet = await self._get_wallet()
-        if not wallet:
-            return {"error": "Wallet address unknown"}
-        return await self._resource_get(f"/users/{wallet}/account")
+            if take_profit:
+                tp_result = await self._exchange_post({
+                    "type": "order",
+                    "orders": [{
+                        "a": asset_id,
+                        "b": not is_long,
+                        "p": self._format_price(take_profit),
+                        "s": sz,
+                        "r": True,
+                        "t": {"trigger": {
+                            "triggerPx": self._format_price(take_profit),
+                            "isMarket": True,
+                            "tpsl": "tp",
+                        }},
+                    }],
+                    "grouping": "na",
+                })
+                results["take_profit"] = tp_result
 
-    async def get_trade_history(self, pair: str = None, limit: int = 50) -> dict:
-        """Query trade history."""
-        wallet = await self._get_wallet()
-        if not wallet:
-            return {"error": "Wallet address unknown"}
-        params = f"?limit={limit}"
-        if pair:
-            params += f"&pair={pair}"
-        return await self._resource_get(f"/users/{wallet}/perp-trades{params}")
+            if stop_loss:
+                sl_result = await self._exchange_post({
+                    "type": "order",
+                    "orders": [{
+                        "a": asset_id,
+                        "b": not is_long,
+                        "p": self._format_price(stop_loss),
+                        "s": sz,
+                        "r": True,
+                        "t": {"trigger": {
+                            "triggerPx": self._format_price(stop_loss),
+                            "isMarket": True,
+                            "tpsl": "sl",
+                        }},
+                    }],
+                    "grouping": "na",
+                })
+                results["stop_loss"] = sl_result
 
-    async def get_tickers(self) -> dict:
-        """Query all supported tickers (mark price, funding, OI)."""
-        return await self._resource_get("/tickers")
-
-    async def _resource_get(self, path: str) -> dict:
-        """GET from dgclaw-trader.virtuals.io resource API."""
-        await self._ensure_res_session()
-        url = f"{DGCLAW_RESOURCE_BASE}{path}"
-        try:
-            async with self._res_session.get(
-                url, timeout=aiohttp.ClientTimeout(total=15)
-            ) as r:
-                if r.status >= 400:
-                    body = await r.text()
-                    return {"error": f"HTTP {r.status}: {body[:200]}"}
-                return await r.json()
-        except Exception as e:
-            return {"error": f"Resource query failed: {e}"}
+        return {"status": "completed", "results": results}
 
     # ------------------------------------------------------------------
     # Agent status
     # ------------------------------------------------------------------
 
     async def get_agent_status(self) -> dict:
-        """Check ACP connectivity and account status via REST API."""
-        try:
-            result = await self._acp_get("/acp/me")
-        except RuntimeError as e:
-            # API key not configured
+        """Check Hyperliquid connectivity and account status."""
+        has_wallet = self._account is not None
+        has_master = self._master_address is not None
+
+        if not has_wallet and not has_master:
             self._connected = False
             return {
                 "status": "disconnected",
                 "connected": False,
-                "error": str(e),
-                "message": "ACP API key not configured",
+                "error": "HL_API_WALLET_KEY and HL_MASTER_ADDRESS not set",
+                "message": "Set API wallet key and master address in .env",
             }
 
-        if "error" in result:
-            self._connected = False
-            return {
-                "status": "disconnected",
-                "connected": False,
-                "error": result["error"],
-                "message": "Cannot reach ACP API",
-            }
-
-        data = result.get("data", result)
-        wallet = data.get("walletAddress") or data.get("address", "unknown")
-        self._wallet = wallet
-        self._connected = True
-
-        # Get account balance and positions
+        # Test connectivity
         account = await self.get_account()
         positions = await self.get_positions()
 
+        self._connected = "error" not in account
+
         return {
-            "status": "connected",
-            "connected": True,
-            "executor": "dgclaw",
-            "wallet": wallet,
-            "agent_name": data.get("name", ""),
+            "status": "connected" if self._connected else "disconnected",
+            "connected": self._connected,
+            "executor": "dgclaw-v4",
+            "mode": "direct-hl",
+            "wallet": self._account.address if self._account else None,
+            "master_address": self._master_address,
             "trader_wallet": DGCLAW_TRADER_WALLET,
             "account": account if "error" not in account else None,
             "positions": positions if "error" not in positions else None,
-            "resource_api": DGCLAW_RESOURCE_BASE,
-            "acp_api": ACP_API_BASE,
+            "hl_api": HL_API_BASE,
+            "forum": DGCLAW_FORUM_BASE,
         }
 
     # ------------------------------------------------------------------
@@ -638,7 +775,7 @@ class DGClawExecutor:
     # ------------------------------------------------------------------
 
     async def execute_commands(self, commands: List[dict]) -> List[dict]:
-        """Execute a batch of entry/exit commands via ACP jobs."""
+        """Execute a batch of entry/exit commands via Hyperliquid direct API."""
         results = []
         for cmd in commands:
             try:

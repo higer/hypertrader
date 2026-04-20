@@ -5,7 +5,7 @@ trading loop in the background.
 
 Execution modes:
   - Dry-run (default): paper trading with real market data
-  - Live + DGClaw: direct ACP job execution (high-frequency, no AI overhead)
+  - Live + DGClaw: direct Hyperliquid API trading via API wallet (v4.0)
   - Live + OpenClaw: natural-language prompts via AI gateway (legacy)
 """
 
@@ -47,7 +47,7 @@ async def lifespan(app: FastAPI):
     # Choose executor: DGClaw (direct ACP) or OpenClaw (NL AI)
     if cfg.dgclaw.enabled:
         executor = DGClawExecutor(cfg.dgclaw)
-        logger.info("Executor: DGClaw (direct ACP — high-frequency mode)")
+        logger.info("Executor: DGClaw v4.0 (direct Hyperliquid API)")
     else:
         executor = OpenClawExecutor(cfg.openclaw)
         logger.info("Executor: OpenClaw (NL AI gateway)")
@@ -172,21 +172,21 @@ async def trading_loop():
                         logger.info(f"Agent result: {cmd['action']} {cmd['coin']} → {status_str}")
                         await notifier.on_order(cmd, res)
 
-                        # Sync internal state with ACP result
+                        # Sync internal state with executor result
                         if not success:
                             if cmd["action"] == "open":
-                                # ACP failed to open → remove internal position
+                                # Executor failed to open → remove internal position
                                 risk.rollback_position(cmd["coin"], cmd["direction"])
                                 await notifier.on_system(
                                     f"Rolled back OPEN {cmd['direction']} {cmd['coin']} "
-                                    f"— ACP failed: {res.get('error','?')}"
+                                    f"— execution failed: {res.get('error','?')}"
                                 )
                             elif cmd["action"] == "close":
-                                # ACP failed to close → restore internal position
+                                # Executor failed to close → restore internal position
                                 risk.rollback_exit(cmd)
                                 await notifier.on_system(
                                     f"Rolled back CLOSE {cmd['direction']} {cmd['coin']} "
-                                    f"— ACP failed, position restored"
+                                    f"— execution failed, position restored"
                                 )
 
             # -- Broadcast to frontend --
@@ -298,7 +298,7 @@ async def update_config(body: ConfigUpdate):
         if new_cfg.dgclaw.enabled and not isinstance(old_executor, DGClawExecutor):
             await old_executor.close()
             state["executor"] = DGClawExecutor(new_cfg.dgclaw)
-            logger.info("Executor switched to DGClaw (direct ACP)")
+            logger.info("Executor switched to DGClaw v4.0 (direct HL API)")
         elif not new_cfg.dgclaw.enabled and not isinstance(old_executor, OpenClawExecutor):
             await old_executor.close()
             state["executor"] = OpenClawExecutor(new_cfg.openclaw)

@@ -9,3 +9,5 @@ python-dotenv>=1.0
 loguru>=0.7
 apscheduler>=3.10
 requests>=2.31
+eth-account>=0.11
+hyperliquid-python-sdk>=0.4
