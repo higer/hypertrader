@@ -47,25 +47,53 @@ DGCLAW_FORUM_BASE = "https://degen.virtuals.io"
 # Hyperliquid EIP-712 signing helpers
 # ---------------------------------------------------------------------------
 
+def _resolve_key(cfg: DGClawConfig) -> str:
+    """
+    Resolve HL_API_WALLET_KEY from multiple sources (priority order):
+      1. cfg.hl_api_wallet_key  (from system_config.json or in-memory config)
+      2. os.getenv("HL_API_WALLET_KEY")  (from .env / shell environment)
+    Pydantic's default_factory is skipped when JSON has explicit null,
+    so we must always check env as fallback.
+    """
+    key = (cfg.hl_api_wallet_key or "").strip()
+    if not key:
+        key = os.getenv("HL_API_WALLET_KEY", "").strip()
+    return key
+
+
+def _resolve_master(cfg: DGClawConfig) -> str:
+    """
+    Resolve HL_MASTER_ADDRESS from config or env.
+    Also checks HL_API_WALLET_ADDRESS as a common alternative name.
+    """
+    addr = (cfg.hl_master_address or "").strip()
+    if not addr:
+        addr = os.getenv("HL_MASTER_ADDRESS", "").strip()
+    if not addr:
+        # Common alternative name users might use
+        addr = os.getenv("HL_API_WALLET_ADDRESS", "").strip()
+    return addr
+
+
 def _load_wallet(cfg: DGClawConfig):
     """Load API wallet from config or env."""
-    key = cfg.hl_api_wallet_key or os.getenv("HL_API_WALLET_KEY", "").strip()
+    key = _resolve_key(cfg)
     if not key:
-        return None, None
+        return None, None, "HL_API_WALLET_KEY is empty — set it in .env or config"
     try:
         from eth_account import Account
         if not key.startswith("0x"):
             key = "0x" + key
         account = Account.from_key(key)
-        return account, key
+        return account, key, None
     except Exception as e:
         logger.error(f"Failed to load API wallet: {e}")
-        return None, None
+        return None, None, f"HL_API_WALLET_KEY is set but invalid: {e}"
 
 
 def _get_master_address(cfg: DGClawConfig) -> Optional[str]:
     """Get master wallet address."""
-    addr = cfg.hl_master_address or os.getenv("HL_MASTER_ADDRESS", "").strip()
+    addr = _resolve_master(cfg)
     return addr if addr else None
 
 
@@ -86,18 +114,23 @@ class DGClawExecutor:
         self._connected: Optional[bool] = None
         self._account = None
         self._api_key = None
+        self._wallet_error: Optional[str] = None
         self._master_address: Optional[str] = None
         self._asset_meta: Dict[str, dict] = {}  # coin → {index, szDecimals, maxLeverage}
         self._meta_ts: float = 0  # last meta refresh time
 
         # Load wallet
-        self._account, self._api_key = _load_wallet(cfg)
-        self._master_address = _get_master_address(cfg)
+        self._reload_wallet()
+
+    def _reload_wallet(self):
+        """(Re-)load wallet credentials from config + env vars."""
+        self._account, self._api_key, self._wallet_error = _load_wallet(self.cfg)
+        self._master_address = _get_master_address(self.cfg)
 
         if self._account:
             logger.info(f"DGClaw executor: API wallet {self._account.address}")
         else:
-            logger.warning("DGClaw executor: HL_API_WALLET_KEY not set — trading disabled")
+            logger.warning(f"DGClaw executor: {self._wallet_error or 'wallet not loaded'}")
         if self._master_address:
             logger.info(f"DGClaw executor: master address {self._master_address}")
         else:
@@ -268,7 +301,11 @@ class DGClawExecutor:
         Uses the Hyperliquid Python SDK for proper EIP-712 signing.
         """
         if not self._account:
-            return {"error": "HL_API_WALLET_KEY not set — cannot trade"}
+            # Try reloading — user may have updated .env since startup
+            self._reload_wallet()
+            if not self._account:
+                err = self._wallet_error or "HL_API_WALLET_KEY not set"
+                return {"error": f"{err} — cannot trade"}
 
         await self._ensure_session()
 

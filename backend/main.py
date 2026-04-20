@@ -307,6 +307,7 @@ async def update_config(body: ConfigUpdate):
             # Same type — update config in-place
             if isinstance(old_executor, DGClawExecutor):
                 old_executor.cfg = new_cfg.dgclaw
+                old_executor._reload_wallet()  # re-resolve keys from env/config
             else:
                 old_executor.cfg = new_cfg.openclaw
                 old_executor.base = new_cfg.openclaw.agent_endpoint.rstrip("/")

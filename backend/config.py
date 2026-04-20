@@ -3,7 +3,7 @@ Global configuration for the Hyperliquid Perps Trading System.
 All tuneable parameters are centralised here.
 """
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from typing import Optional
 import json, os
 from dotenv import load_dotenv
@@ -83,6 +83,14 @@ class AlertConfig(BaseModel):
     dingtalk_webhook: Optional[str] = None
     log_file: str = "trading.log"
 
+    @model_validator(mode="after")
+    def _merge_env_vars(self):
+        if not self.telegram_bot_token:
+            self.telegram_bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
+        if not self.telegram_chat_id:
+            self.telegram_chat_id = os.getenv("TELEGRAM_CHAT_ID")
+        return self
+
 class OpenClawConfig(BaseModel):
     agent_endpoint: str = Field(
         default_factory=lambda: os.getenv("OPENCLAW_ENDPOINT", "http://127.0.0.1:18789"),
@@ -125,6 +133,25 @@ class DGClawConfig(BaseModel):
     slippage_pct: float = Field(0.01, description="Market order slippage buffer (1%)")
     confirm_before_execute: bool = Field(False, description="Require confirmation (disabled for HFT)")
 
+    @model_validator(mode="after")
+    def _merge_env_vars(self):
+        """
+        When loading from system_config.json, Pydantic sees explicit null
+        and skips default_factory. We must always fallback to env vars
+        so that .env settings aren't silently ignored.
+        """
+        if not self.hl_api_wallet_key:
+            self.hl_api_wallet_key = os.getenv("HL_API_WALLET_KEY")
+        if not self.hl_master_address:
+            self.hl_master_address = os.getenv("HL_MASTER_ADDRESS") or os.getenv("HL_API_WALLET_ADDRESS")
+        if not self.api_key:
+            self.api_key = os.getenv("DGCLAW_API_KEY")
+        if not self.acp_api_key:
+            self.acp_api_key = os.getenv("LITE_AGENT_API_KEY")
+        if not self.acp_builder_code:
+            self.acp_builder_code = os.getenv("ACP_BUILDER_CODE")
+        return self
+
 class SystemConfig(BaseModel):
     dry_run: bool = True                     # True = no real execution, signals only
     risk: RiskConfig = RiskConfig()
@@ -140,9 +167,22 @@ class SystemConfig(BaseModel):
     data_lookback_bars: int = 200
     poll_interval_sec: int = 15
 
+    # Fields sourced from .env — never persist to JSON (they'd become null)
+    _SECRET_FIELDS = {
+        "dgclaw": {"hl_api_wallet_key", "hl_master_address", "api_key", "acp_api_key", "acp_builder_code"},
+        "alert": {"telegram_bot_token", "telegram_chat_id"},
+        "openclaw": {"api_key"},
+    }
+
     def save(self, path: str = "system_config.json"):
+        data = self.model_dump()
+        # Strip secret fields so they don't get saved as null
+        for section, fields in self._SECRET_FIELDS.items():
+            if section in data:
+                for f in fields:
+                    data[section].pop(f, None)
         with open(path, "w") as f:
-            f.write(self.model_dump_json(indent=2))
+            json.dump(data, f, indent=2)
 
     @classmethod
     def load(cls, path: str = "system_config.json") -> "SystemConfig":
