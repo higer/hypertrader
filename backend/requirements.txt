@@ -10,4 +10,6 @@ loguru>=0.7
 apscheduler>=3.10
 requests>=2.31
 eth-account>=0.11
+eth-utils>=2.3
+msgpack>=1.0
 hyperliquid-python-sdk>=0.4

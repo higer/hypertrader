@@ -313,14 +313,10 @@ class DGClawExecutor:
             nonce = int(time.time() * 1000)
 
         try:
-            from hyperliquid.utils.signing import (
-                sign_l1_action,
-                float_to_wire,
-                order_type_to_wire,
-            )
-            # Use the SDK's signing
+            from hyperliquid.utils.signing import sign_l1_action
+            # SDK signature: sign_l1_action(wallet, action, active_pool, nonce, expires_after, is_mainnet)
             signature = sign_l1_action(
-                self._account, action, vault_address, nonce, True
+                self._account, action, vault_address, nonce, None, True
             )
             payload = {
                 "action": action,
@@ -348,60 +344,72 @@ class DGClawExecutor:
                                  vault_address: str = None) -> dict:
         """
         Fallback: Sign and POST using raw eth_account EIP-712.
-        Used when hyperliquid-python-sdk is not installed.
+        Replicates the exact signing logic from hyperliquid-python-sdk:
+          1. msgpack(action) + nonce bytes + vault flag → keccak hash
+          2. Construct phantom agent {source: "a", connectionId: hash}
+          3. EIP-712 sign the phantom agent
+        Requires: eth_account, msgpack, eth_utils
         """
         try:
-            from eth_account.messages import encode_structured_data
+            import msgpack
+            from eth_account.messages import encode_typed_data
+            from eth_utils import keccak, to_hex
 
-            # Hyperliquid uses a specific EIP-712 domain
-            domain = {
-                "name": "Exchange",
-                "version": "1",
-                "chainId": 1337,
-                "verifyingContract": "0x0000000000000000000000000000000000000000",
-            }
+            # Step 1: Hash the action (same as SDK's action_hash)
+            data = msgpack.packb(action)
+            data += nonce.to_bytes(8, "big")
+            if vault_address is None:
+                data += b"\x00"
+            else:
+                data += b"\x01"
+                addr_hex = vault_address[2:] if vault_address.startswith("0x") else vault_address
+                data += bytes.fromhex(addr_hex)
+            # expires_after = None → no extra bytes
+            action_hash = keccak(data)
 
-            # Build the typed data for the action
-            # The exact structure depends on the action type
-            action_str = json.dumps(action, separators=(",", ":"), sort_keys=True)
-            connection_id = action_str  # simplified hash
+            # Step 2: Construct phantom agent
+            phantom_agent = {"source": "a", "connectionId": action_hash}
 
+            # Step 3: Build EIP-712 typed data
             typed_data = {
+                "domain": {
+                    "chainId": 1337,
+                    "name": "Exchange",
+                    "verifyingContract": "0x0000000000000000000000000000000000000000",
+                    "version": "1",
+                },
                 "types": {
+                    "Agent": [
+                        {"name": "source", "type": "string"},
+                        {"name": "connectionId", "type": "bytes32"},
+                    ],
                     "EIP712Domain": [
                         {"name": "name", "type": "string"},
                         {"name": "version", "type": "string"},
                         {"name": "chainId", "type": "uint256"},
                         {"name": "verifyingContract", "type": "address"},
                     ],
-                    "HyperliquidTransaction:Approve": [
-                        {"name": "hyperliquidChain", "type": "string"},
-                        {"name": "signatureChainId", "type": "uint64"},
-                        {"name": "nonce", "type": "uint64"},
-                    ],
                 },
-                "primaryType": "HyperliquidTransaction:Approve",
-                "domain": domain,
-                "message": {
-                    "hyperliquidChain": "Mainnet",
-                    "signatureChainId": "0x66eee",
-                    "nonce": nonce,
-                },
+                "primaryType": "Agent",
+                "message": phantom_agent,
             }
 
-            signed = self._account.sign_message(
-                encode_structured_data(typed_data)
-            )
+            # Step 4: Sign
+            structured_data = encode_typed_data(full_message=typed_data)
+            signed = self._account.sign_message(structured_data)
+            signature = {
+                "r": to_hex(signed["r"]),
+                "s": to_hex(signed["s"]),
+                "v": signed["v"],
+            }
 
             payload = {
                 "action": action,
                 "nonce": nonce,
-                "signature": {
-                    "r": hex(signed.r),
-                    "s": hex(signed.s),
-                    "v": signed.v,
-                },
+                "signature": signature,
             }
+            if vault_address:
+                payload["vaultAddress"] = vault_address
 
             async with self._session.post(
                 HL_EXCHANGE_URL, json=payload,
@@ -411,6 +419,13 @@ class DGClawExecutor:
                 if r.status >= 400:
                     return {"error": f"HTTP {r.status}: {json.dumps(body)[:300]}"}
                 return body
+        except ImportError as e:
+            logger.error(f"Missing dependency for raw signing: {e}")
+            return {
+                "error": f"Missing package: {e}. Install with: "
+                         f"pip install hyperliquid-python-sdk (recommended) "
+                         f"or pip install msgpack eth-utils eth-account"
+            }
         except Exception as e:
             logger.error(f"Raw exchange POST failed: {e}")
             return {"error": f"Signing/exchange failed: {e}"}
